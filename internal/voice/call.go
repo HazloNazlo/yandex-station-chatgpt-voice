@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/json/jsontext"
+	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -15,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"uuid"
 
 	"github.com/pion/logging"
 	"github.com/pion/sctp"
@@ -35,6 +38,7 @@ var errProtocolHangup = errors.New("voice protocol hangup")
 type peer struct {
 	pc        *webrtc.PeerConnection
 	dc        *webrtc.DataChannel
+	dcMu      sync.Mutex
 	mic       *webrtc.TrackLocalStaticSample
 	ctx       context.Context
 	cancel    context.CancelCauseFunc
@@ -48,6 +52,12 @@ type peer struct {
 	failureMu sync.Mutex
 	failure   error
 	abort     context.CancelCauseFunc
+	callsMu     sync.Mutex
+	seenCalls   map[string]bool
+	audio       *audio
+	userMu      sync.Mutex
+	userTextBuf strings.Builder
+	isUserMsg   bool
 }
 
 //nolint:funlen,gocognit // Callback closures share peer teardown and cancellation state; keep their registration together.
@@ -67,12 +77,13 @@ func newPeer(
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(settings))
 	ctx, cancel := context.WithCancelCause(ctx)
 	p := &peer{
-		report: report,
-		ctx:    ctx,
-		cancel: cancel,
-		ready:  make(chan struct{}),
-		tracks: make(chan *webrtc.TrackRemote, 1),
-		abort:  abort,
+		report:    report,
+		ctx:       ctx,
+		cancel:    cancel,
+		ready:     make(chan struct{}),
+		tracks:    make(chan *webrtc.TrackRemote, 1),
+		abort:     abort,
+		seenCalls: make(map[string]bool),
 	}
 	var err error
 	p.pc, err = api.NewPeerConnection(
@@ -232,11 +243,280 @@ func (p *peer) outcome(result error) error {
 	return result
 }
 
+func (p *peer) sendText(text string) error {
+	p.dcMu.Lock()
+	defer p.dcMu.Unlock()
+	if p.dc == nil {
+		return errors.New("voice control channel is nil")
+	}
+	return p.dc.SendText(text)
+}
+
+func (p *peer) sendRelayText(text string) error {
+	msgID := strings.ToLower(uuid.New().String())
+	now := float64(time.Now().UnixNano()) / 1e9
+
+	innerMsg := map[string]any{
+		"type": "relay_message",
+		"payload": map[string]any{
+			"type": "relay_message",
+			"message": map[string]any{
+				"id":          msgID,
+				"author":      map[string]any{"role": "user"},
+				"create_time": now,
+				"content": map[string]any{
+					"content_type": "text",
+					"parts":        []string{text},
+				},
+				"metadata": map[string]any{
+					"serialization_metadata": map[string]any{
+						"custom_symbol_offsets": []any{},
+					},
+				},
+				"clientMetadata": map[string]any{
+					"isOptimistic": true,
+				},
+			},
+		},
+	}
+	innerBytes, err := json.Marshal(innerMsg)
+	if err != nil {
+		return err
+	}
+
+	outerMsg := map[string]any{
+		"type": "data_message",
+		"data": string(innerBytes),
+	}
+	outerBytes, err := json.Marshal(outerMsg)
+	if err != nil {
+		return err
+	}
+
+	return p.sendText(string(outerBytes))
+}
+
 func (p *peer) handleMessage(data []byte) {
 	//nolint:errorlint // Only the exact sentinel is benign; wrapped or joined failures must remain failures.
 	if p.ctx.Err() != nil && context.Cause(p.ctx) != errProtocolHangup {
 		return
 	}
+
+	unwrapped, eventType := extractWirePayload(data)
+	if eventType != "" && eventType != "chat_message_delta" {
+		p.report.Printf("DC recv event [%s]: %s", eventType, string(unwrapped))
+	}
+
+	switch eventType {
+	case "chat_message_delta":
+		var cmd struct {
+			Delta struct {
+				C int            `json:"c"`
+				P string         `json:"p"`
+				O string         `json:"o"`
+				V jsontext.Value `json:"v"`
+			} `json:"delta"`
+		}
+		if json.Unmarshal(unwrapped, &cmd) == nil {
+			p.userMu.Lock()
+			finished := false
+
+			if cmd.Delta.O == "add" {
+				var addMsg struct {
+					Message struct {
+						ID     string `json:"id"`
+						Author struct {
+							Role string `json:"role"`
+						} `json:"author"`
+						Content struct {
+							Parts []struct {
+								Text string `json:"text"`
+							} `json:"parts"`
+						} `json:"content"`
+					} `json:"message"`
+				}
+				if json.Unmarshal(cmd.Delta.V, &addMsg) == nil {
+					if addMsg.Message.Author.Role == "user" {
+						p.isUserMsg = true
+						p.userTextBuf.Reset()
+						for _, pt := range addMsg.Message.Content.Parts {
+							p.userTextBuf.WriteString(pt.Text)
+						}
+					} else {
+						// Assistant message starting -> previous user turn has completed
+						if p.isUserMsg {
+							finished = true
+						}
+					}
+				}
+			}
+
+			// Handle patches array if present in cmd.Delta.V (whether cmd.Delta.O is "patch" or empty)
+			if len(cmd.Delta.V) > 0 && cmd.Delta.V[0] == '[' {
+				var patches []struct {
+					P string         `json:"p"`
+					O string         `json:"o"`
+					V jsontext.Value `json:"v"`
+				}
+				if json.Unmarshal(cmd.Delta.V, &patches) == nil {
+					for _, pt := range patches {
+						if pt.O == "append" && strings.HasPrefix(pt.P, "/message/content/parts/") {
+							if p.isUserMsg {
+								var textPart string
+								if json.Unmarshal(pt.V, &textPart) == nil {
+									p.userTextBuf.WriteString(textPart)
+								}
+							}
+						}
+						if pt.P == "/message/status" {
+							var status string
+							if json.Unmarshal(pt.V, &status) == nil && status == "finished_successfully" {
+								if p.isUserMsg {
+									finished = true
+								}
+							}
+						}
+					}
+				}
+			}
+
+			// Handle single patch status on cmd.Delta
+			if cmd.Delta.P == "/message/status" {
+				var val string
+				if json.Unmarshal(cmd.Delta.V, &val) == nil && val == "finished_successfully" {
+					if p.isUserMsg {
+						finished = true
+					}
+				}
+			}
+
+			if finished && p.isUserMsg {
+				fullText := strings.TrimSpace(p.userTextBuf.String())
+				p.userTextBuf.Reset()
+				p.isUserMsg = false
+				p.userMu.Unlock()
+
+				if fullText != "" {
+					p.report.Printf("User speech recognized: %q", fullText)
+
+					// A. Volume command check
+					if isVol, newVol, delta := parseVolumeCommand(fullText); isVol {
+						if newVol >= 0 {
+							if actual, err := setStationVolume(newVol); err == nil {
+								p.report.Printf("Volume command executed: Station volume set to %d%%", actual)
+							} else {
+								p.report.Printf("Volume error: %v", err)
+							}
+						} else if delta != 0 {
+							if actual, err := adjustStationVolume(delta); err == nil {
+								p.report.Printf("Volume command executed: Station volume adjusted by %d to %d%%", delta, actual)
+							} else {
+								p.report.Printf("Volume error: %v", err)
+							}
+						}
+					}
+
+					// B. Web search check
+					if needSearch, query := detectSearchQuery(fullText); needSearch {
+						p.wg.Go(func() {
+							p.report.Printf("Web search triggered for: %q", query)
+							searchCtx, cancel := context.WithTimeout(p.ctx, 7*time.Second)
+							defer cancel()
+							results, err := searchWeb(searchCtx, query)
+							if err != nil {
+								p.report.Printf("Search error: %v", err)
+								return
+							}
+							p.report.Printf("Search completed. Sending relay text to ChatGPT...")
+							relayPrompt := fmt.Sprintf("[Актуальные проверенные данные из интернета по запросу %q]:\n%s\n\nИспользуй эти факты и кратко озвучь ответ пользователю на его вопрос.", query, results)
+							if p.audio != nil {
+								p.audio.flushPlayback()
+							}
+							if err := p.sendRelayText(relayPrompt); err != nil {
+								p.report.Printf("Failed to send relay search: %v", err)
+							} else {
+								p.report.Print("Relay search info delivered to ChatGPT.")
+							}
+						})
+					}
+				}
+			} else {
+				p.userMu.Unlock()
+			}
+		}
+
+	case "input_audio_buffer.speech_started":
+		if p.audio != nil {
+			p.audio.flushPlayback()
+		}
+	}
+
+	calls := parseToolCalls(data)
+	for _, call := range calls {
+		p.callsMu.Lock()
+		alreadySeen := p.seenCalls[call.CallID]
+		if !alreadySeen {
+			p.seenCalls[call.CallID] = true
+		}
+		p.callsMu.Unlock()
+
+		if alreadySeen {
+			continue
+		}
+
+		callID := call.CallID
+		name := call.Name
+		args := call.Arguments
+
+		p.wg.Go(func() {
+			p.report.Printf("Executing tool %q (call_id: %s) with args: %s", name, callID, args)
+			var output string
+			var execErr error
+
+			switch name {
+			case "set_volume":
+				output, execErr = handleSetVolume(args)
+			case "search_web":
+				searchCtx, searchCancel := context.WithTimeout(p.ctx, 8*time.Second)
+				defer searchCancel()
+				output, execErr = handleSearchWeb(searchCtx, args)
+			default:
+				output = fmt.Sprintf(`{"error": "unknown tool %s"}`, name)
+			}
+
+			if execErr != nil {
+				p.report.Printf("Tool %q error: %v", name, execErr)
+				output = fmt.Sprintf(`{"error": %q}`, execErr.Error())
+			} else {
+				p.report.Printf("Tool %q completed successfully: %s", name, output)
+			}
+
+			itemMsg := map[string]any{
+				"type": "conversation.item.create",
+				"item": map[string]any{
+					"type":    "function_call_output",
+					"call_id": callID,
+					"output":  output,
+				},
+			}
+			itemBytes, _ := json.Marshal(itemMsg)
+			if err := p.sendText(string(itemBytes)); err != nil {
+				p.report.Printf("Failed to send function_call_output: %v", err)
+				return
+			}
+
+			respMsg := map[string]any{
+				"type": "response.create",
+			}
+			respBytes, _ := json.Marshal(respMsg)
+			if err := p.sendText(string(respBytes)); err != nil {
+				p.report.Printf("Failed to send response.create: %v", err)
+				return
+			}
+			p.report.Printf("Triggered ChatGPT response after tool %q.", name)
+		})
+	}
+
 	ev, err := decodeEvent(data)
 	switch {
 	case err != nil:
@@ -412,10 +692,16 @@ func runCall(e *stationEpoch, sessionFile string, capture *stationCapture, setti
 	}
 	ctx := e.ctx
 	var workers sync.WaitGroup
+	callStart := time.Now()
+	settingsEngine := webrtc.SettingEngine{}
+	settingsEngine.SetNetworkTypes([]webrtc.NetworkType{webrtc.NetworkTypeUDP4})
+	settingsEngine.SetInterfaceFilter(func(name string) bool {
+		return name == "wlan0" || strings.HasPrefix(name, "wl")
+	})
 	p, err := newPeer(
 		ctx,
-		webrtc.SettingEngine{},
-		[]webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302", "stun:stun4.l.google.com:19302"}}},
+		settingsEngine,
+		[]webrtc.ICEServer{{URLs: []string{"stun:stun.l.google.com:19302"}}},
 		e.report,
 		e.revoke,
 	)
@@ -478,14 +764,17 @@ func runCall(e *stationEpoch, sessionFile string, capture *stationCapture, setti
 	if err != nil {
 		return complete(err)
 	}
+	e.report.Printf("ICE offer ready in %v", time.Since(callStart))
 	session, err := encodeSession(time.Now(), settings)
 	if err != nil {
 		return errors.New("cannot encode voice session")
 	}
+	sigStart := time.Now()
 	answer, err := exchangeOffer(setupCtx, client, auth, offer, session)
 	if err != nil {
 		return complete(err)
 	}
+	e.report.Printf("Signaling exchange in %v", time.Since(sigStart))
 	if ctx.Err() != nil {
 		return complete(context.Cause(ctx))
 	}
@@ -493,6 +782,7 @@ func runCall(e *stationEpoch, sessionFile string, capture *stationCapture, setti
 		return err
 	}
 	ready := false
+	waitStart := time.Now()
 	for !ready {
 		select {
 		case <-setupCtx.Done():
@@ -504,12 +794,14 @@ func runCall(e *stationEpoch, sessionFile string, capture *stationCapture, setti
 			ready = true
 		}
 	}
+	e.report.Printf("WebRTC DataChannel ready in %v (total setup: %v)", time.Since(waitStart), time.Since(callStart))
 	if ctx.Err() != nil {
 		return complete(context.Cause(ctx))
 	}
 	if setupCtx.Err() != nil {
 		return errors.New("voice setup ended before media became ready")
 	}
+	p.audio = e.output
 	if err = e.output.open(); err != nil {
 		return err
 	}

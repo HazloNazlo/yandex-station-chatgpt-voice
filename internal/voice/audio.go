@@ -37,6 +37,7 @@ const maxOpusSamples = 5760
 const playbackDrainTimeout = 2 * time.Second
 const cueTimeout = 2 * time.Second
 const cueVolume = 0.3
+const playbackGain = 1.78 // +5 dB boost to match Alice's native volume level
 const readyCueFrequency = 880
 const endCueFrequency = 440
 
@@ -254,12 +255,34 @@ func (a *audio) queueDecoded(pcm []int16) {
 	for len(pcm) > 0 {
 		n := min(len(pcm), samplesPerFrame*stereoChannels)
 		block := playbackBlock{epoch: a.epoch.number, used: n / stereoChannels}
-		copy(block.pcm[:], pcm[:n])
+		for i, s := range pcm[:n] {
+			v := int32(float64(s) * playbackGain)
+			if v > math.MaxInt16 {
+				v = math.MaxInt16
+			} else if v < math.MinInt16 {
+				v = math.MinInt16
+			}
+			block.pcm[i] = int16(v)
+		}
 		pcm = pcm[n:]
 		select {
 		case a.playback <- block:
 		default:
 			a.playbackDrops.Add(1)
+		}
+	}
+}
+
+func (a *audio) flushPlayback() {
+	if a == nil {
+		return
+	}
+	a.queueMu.Lock()
+	defer a.queueMu.Unlock()
+	for len(a.playback) > 0 {
+		select {
+		case <-a.playback:
+		default:
 		}
 	}
 }

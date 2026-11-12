@@ -50,20 +50,20 @@ trap 'exit 143' TERM
 
 for compiler in cc ar ranlib; do
   wrapper="$PWD/.cache/arm-$compiler"
-  case "$compiler" in cc) flags=' -target arm-linux-gnueabihf.2.30 -mcpu=cortex_a7' ;; *) flags= ;; esac
+  case "$compiler" in cc) flags=' -target arm-linux-gnueabihf.2.23 -mcpu=cortex_a7' ;; *) flags= ;; esac
   # Keep UV and positional arguments literal for the generated wrapper.
   # shellcheck disable=SC2016
-  printf '#!/bin/sh\nexec "${UV:-uv}" tool run --from ziglang==%s python-zig %s%s "$@"\n' "$ZIG_VERSION" "$compiler" "$flags" > "$wrapper"
+  printf '#!/bin/sh\nexec "${UV:-uv}" tool run --offline --from ziglang==%s python-zig %s%s "$@"\n' "$ZIG_VERSION" "$compiler" "$flags" > "$wrapper"
   chmod 755 "$wrapper"
 done
 export UV
-[ "$("$UV" tool run --from "ziglang==$ZIG_VERSION" python-zig version)" = "${ZIG_VERSION%.post*}" ] || {
+[ "$("$UV" tool run --offline --from "ziglang==$ZIG_VERSION" python-zig version)" = "${ZIG_VERSION%.post*}" ] || {
   echo 'Unexpected Zig version.' >&2
   exit 1
 }
 
 # The absolute prefix is embedded in opus.pc; a moved cache must be rebuilt.
-key="zig=$ZIG_VERSION target=arm-linux-gnueabihf.2.30 cpu=cortex_a7 opus=$OPUS_SHA256 static,no-extra,no-doc,no-intrinsics,no-rtcd,no-asm prefix=$prefix"
+key="zig=$ZIG_VERSION target=arm-linux-gnueabihf.2.23 cpu=cortex_a7 opus=$OPUS_SHA256 static,no-extra,no-doc,no-intrinsics,no-rtcd,no-asm prefix=$prefix"
 if [ ! -f "$prefix/.build-key" ] || [ "$(cat "$prefix/.build-key")" != "$key" ] ||
   [ ! -f "$prefix/lib/libopus.a" ] || [ ! -f "$prefix/include/opus/opus.h" ] || [ ! -f "$prefix/lib/pkgconfig/opus.pc" ]; then
   if [ ! -f "$archive" ]; then
