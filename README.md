@@ -248,7 +248,7 @@ sudo apt-get install -y git make curl python3 pkg-config libopus-dev
 curl -LsSf https://astral.sh/uv/install.sh | sh
 
 # 2. Клонируйте репозиторий:
-git clone https://github.com/<ваш-аккаунт>/yandex-station-chatgpt-voice.git
+git clone https://github.com/HazloNazlo/yandex-station-chatgpt-voice.git
 cd yandex-station-chatgpt-voice
 
 # 3. Запустите сборку для ARM:
