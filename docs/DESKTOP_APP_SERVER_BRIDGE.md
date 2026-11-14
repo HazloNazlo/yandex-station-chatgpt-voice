@@ -65,7 +65,9 @@ The bridge does not need to inspect partial transcripts and guess that a user sa
 The backend starts a codex app-server child process and drives it through JSON-RPC 2.0 over newline-delimited JSON on stdio. Codex app-server has a documented thread/turn/item model, initialization handshake, notifications, tool approvals, and dynamic tool APIs:
 - https://learn.chatgpt.com/docs/app-server
 
-The third-party realtime bridge uses an additional experimental feature gate and realtime methods. In the inspected implementation it:
+The third-party realtime bridge uses the App Server's experimental API methods. One nuance from Codex CLI 0.169.0: `realtime_conversation` appears in `codex features list` as `removed true`, because the feature flag itself is now a removed compatibility flag (the source comment says TUI voice availability follows platform support). The `true` is its effective/default state, not a feature-availability guarantee. Do not try to enable this removed flag as a workaround. The protocol method `thread/realtime/start` still exists in this version, but is gated by `initialize.capabilities.experimentalApi: true`. The App Server command is itself experimental and OpenAI says it is not supported for production workloads.
+
+The third-party realtime bridge uses these experimental API methods. In the inspected implementation it:
 
 1. Starts codex --enable realtime_conversation app-server --stdio.
 2. Performs initialize, then sends initialized.
@@ -222,7 +224,11 @@ The Codex app-server's ordinary documented stdio mode is JSONL over stdin/stdout
 
 Do not rewrite the Go client first. Validate the unknown private realtime extension in isolation.
 
-### PoC 1 — SDK/browser
+### PoC 1 — local App Server dynamic tool
+
+Before testing realtime audio, run [FREE_PLAN_BRIDGE_TEST.md](FREE_PLAN_BRIDGE_TEST.md) Gate 3A on the Mac. It performs App Server initialization with `experimentalApi: true`, starts an ephemeral read-only thread, registers `diagnostic_ping`, asks `gpt-6-luna` to call it, handles `item/tool/call`, and verifies the result. This proves the Free-plan App Server + dynamic tool path, but does not prove native realtime voice handoff.
+
+### PoC 2 — SDK/browser
 
 1. Deploy a small long-lived Bun/Node service on a VPS.
 2. Install the MIT-licensed @opencoredev/loginwithchatgpt-core and @opencoredev/loginwithchatgpt-server packages.
@@ -234,7 +240,7 @@ Do not rewrite the Go client first. Validate the unknown private realtime extens
 
 Pass condition: the signed-in account can complete one native realtime handoff and hear the tool result, without an OpenAI Developer API key.
 
-### PoC 2 — Native Station transport
+### PoC 3 — Native Station transport
 
 1. Keep the current Pion peer, Opus tracks, wakeword handling, and Alice gate unchanged.
 2. Add a feature-flagged signaling adapter that posts the Pion offer to a device-authenticated VPS route and receives the SDP answer.
@@ -245,7 +251,7 @@ Pass condition: the signed-in account can complete one native realtime handoff a
 
 Pass condition: Mini 1 can use the new bridge while the current /wm path remains available as a rollback mode.
 
-### PoC 3 — real read-only tools
+### PoC 4 — real read-only tools
 
 Add in this order:
 1. web_search(query, freshness?)
