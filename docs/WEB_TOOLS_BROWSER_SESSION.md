@@ -1,6 +1,12 @@
 # Browser-session tools: audit and implementation plan
 
-**Status:** read-only audit of `main` at `c45c25868d0b464275b123fc414bcc15d72010fd` (14 November 2026). This document deliberately does not switch the project to an OpenAI developer API.
+**Status:** IMPLEMENTED on `main` (commit `aa0e69a`, 14 November 2026).
+- **Direct Spoken Output (`playSpeech`)**: Bypasses WebRTC `relay_message` silence limitation by streaming decoded speech directly to ALSA `aplay` while muting background WebRTC audio (`mutePlayback`).
+- **Open-Meteo & Geocoding Integration**: Natural Russian weather and forecasts with WMO weather codes and grammatical numeral declension, with fallback to `wttr.in`.
+- **`open_url` Tool with SSRF Defense**: Safe HTTP dialer, private/loopback IP range filtering, DNS rebinding mitigation, redirect protection, and readable text extraction.
+- **Strict TLS Verification**: Secure cert pool loading system CA bundles and `/system/vendor/quasar/certs/ca-certificates.crt`, eliminating `InsecureSkipVerify: true`.
+- **Intent Dispatcher**: Covers currency rates (CBR), crypto (CoinGecko), weather, time/date, news, factual lookups (Wikipedia/DuckDuckGo), and URLs.
+- **Test Suite**: 100% passing tests including SSRF defense, live queries, and clean shutdowns.
 
 ## Executive summary
 
