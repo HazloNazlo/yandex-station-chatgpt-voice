@@ -49,9 +49,10 @@ func encodeSession(now time.Time, settings sessionSettings) ([]byte, error) {
 		}
 	}
 	id := strings.ToUpper(uuid.New().String())
+	voiceName := cmp.Or(settings.Voice, getSavedVoice())
 	payload := map[string]any{
 		"backend_reasoning_effort": "instant", "language_code": "auto",
-		"requested_default_model": "", "voice": cmp.Or(settings.Voice, "orbit"), "voice_session_id": id,
+		"requested_default_model": "", "voice": voiceName, "voice_session_id": id,
 		"voice_status_request_id": id, "timezone_offset_min": -east / int(time.Minute/time.Second), "timezone": zone,
 		"voice_mode": "wingman", "model_slug": "", "model_slug_advanced": "",
 		"client_tools": []string{}, "history_and_training_disabled": false,

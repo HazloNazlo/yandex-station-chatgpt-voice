@@ -52,12 +52,13 @@ type peer struct {
 	failureMu sync.Mutex
 	failure   error
 	abort     context.CancelCauseFunc
-	callsMu     sync.Mutex
-	seenCalls   map[string]bool
-	audio       *audio
-	userMu      sync.Mutex
-	userTextBuf strings.Builder
-	isUserMsg   bool
+	callsMu      sync.Mutex
+	seenCalls    map[string]bool
+	audio        *audio
+	userMu       sync.Mutex
+	userTextBuf  strings.Builder
+	isUserMsg    bool
+	lastActivity atomic.Int64
 }
 
 //nolint:funlen,gocognit // Callback closures share peer teardown and cancellation state; keep their registration together.
@@ -296,6 +297,45 @@ func (p *peer) sendRelayText(text string) error {
 	return p.sendText(string(outerBytes))
 }
 
+func (p *peer) sendRelaySystemText(text string) error {
+	msgID := strings.ToLower(uuid.New().String())
+	now := float64(time.Now().UnixNano()) / 1e9
+
+	innerMsg := map[string]any{
+		"type": "relay_message",
+		"payload": map[string]any{
+			"type": "relay_message",
+			"message": map[string]any{
+				"id":          msgID,
+				"author":      map[string]any{"role": "system"},
+				"create_time": now,
+				"content": map[string]any{
+					"content_type": "text",
+					"parts":        []string{text},
+				},
+				"clientMetadata": map[string]any{
+					"isOptimistic": true,
+				},
+			},
+		},
+	}
+	innerBytes, err := json.Marshal(innerMsg)
+	if err != nil {
+		return err
+	}
+
+	outerMsg := map[string]any{
+		"type": "data_message",
+		"data": string(innerBytes),
+	}
+	outerBytes, err := json.Marshal(outerMsg)
+	if err != nil {
+		return err
+	}
+
+	return p.sendText(string(outerBytes))
+}
+
 func (p *peer) handleMessage(data []byte) {
 	//nolint:errorlint // Only the exact sentinel is benign; wrapped or joined failures must remain failures.
 	if p.ctx.Err() != nil && context.Cause(p.ctx) != errProtocolHangup {
@@ -398,8 +438,43 @@ func (p *peer) handleMessage(data []byte) {
 
 				if fullText != "" {
 					p.report.Printf("User speech recognized: %q", fullText)
+					p.lastActivity.Store(time.Now().Unix())
 
-					// A. Volume command check
+					// 1. Hangup check: "пока", "до свидания", "отбой", "стоп", "хватит", "заверши сессию"
+					if isHangup, _ := parseHangupCommand(fullText); isHangup {
+						p.report.Printf("Hangup command triggered by speech: %q", fullText)
+						p.wg.Go(func() {
+							time.Sleep(1200 * time.Millisecond)
+							p.cancel(errProtocolHangup)
+						})
+						return
+					}
+
+					// 2. Voice change check: "смени голос", "поставь женский голос", "какие есть голоса"
+					if isVoiceCmd, newVoice, msg := parseVoiceCommand(fullText); isVoiceCmd {
+						p.report.Printf("Voice command triggered: %q -> %s", fullText, newVoice)
+						p.wg.Go(func() {
+							if newVoice != "" {
+								if err := saveVoice(newVoice); err == nil {
+									p.report.Printf("Saved new voice preference: %s", newVoice)
+								}
+							}
+							if p.audio != nil {
+								p.audio.flushPlayback()
+							}
+							if msg != "" {
+								_ = p.sendRelaySystemText("Произнеси для пользователя следующий текст: " + msg)
+							}
+							if newVoice != "" {
+								// Wait for confirmation to be spoken, then hang up to activate new voice on next session
+								time.Sleep(3500 * time.Millisecond)
+								p.cancel(errProtocolHangup)
+							}
+						})
+						return
+					}
+
+					// 3. Volume command check
 					if isVol, newVol, delta := parseVolumeCommand(fullText); isVol {
 						if newVol >= 0 {
 							if actual, err := setStationVolume(newVol); err == nil {
@@ -416,8 +491,11 @@ func (p *peer) handleMessage(data []byte) {
 						}
 					}
 
-					// B. Web search check
+					// 4. Web search check
 					if needSearch, query := detectSearchQuery(fullText); needSearch {
+						if p.audio != nil {
+							p.audio.flushPlayback()
+						}
 						p.wg.Go(func() {
 							p.report.Printf("Web search triggered for: %q", query)
 							searchCtx, cancel := context.WithTimeout(p.ctx, 7*time.Second)
@@ -446,6 +524,7 @@ func (p *peer) handleMessage(data []byte) {
 		}
 
 	case "input_audio_buffer.speech_started":
+		p.lastActivity.Store(time.Now().Unix())
 		if p.audio != nil {
 			p.audio.flushPlayback()
 		}
@@ -476,10 +555,22 @@ func (p *peer) handleMessage(data []byte) {
 			switch name {
 			case "set_volume":
 				output, execErr = handleSetVolume(args)
+			case "set_voice":
+				output, execErr = handleSetVoice(args)
+				p.wg.Go(func() {
+					time.Sleep(2500 * time.Millisecond)
+					p.cancel(errProtocolHangup)
+				})
 			case "search_web":
 				searchCtx, searchCancel := context.WithTimeout(p.ctx, 8*time.Second)
 				defer searchCancel()
 				output, execErr = handleSearchWeb(searchCtx, args)
+			case "hang_up", "end_session":
+				output = `{"status":"hanging_up"}`
+				p.wg.Go(func() {
+					time.Sleep(1200 * time.Millisecond)
+					p.cancel(errProtocolHangup)
+				})
 			default:
 				output = fmt.Sprintf(`{"error": "unknown tool %s"}`, name)
 			}
@@ -795,6 +886,20 @@ func runCall(e *stationEpoch, sessionFile string, capture *stationCapture, setti
 		}
 	}
 	e.report.Printf("WebRTC DataChannel ready in %v (total setup: %v)", time.Since(waitStart), time.Since(callStart))
+	// 1. Send session.update with tools & instructions over DataChannel
+	if sessionUpdateErr := p.sendText(getSessionUpdateMessage()); sessionUpdateErr != nil {
+		p.report.Printf("Warning: cannot send session.update: %v", sessionUpdateErr)
+	} else {
+		p.report.Print("Delivered session.update with tools to ChatGPT.")
+	}
+
+	// 2. Programmatic Session Priming (Solution #2)
+	primingPrompt := "[Системные инструкции]: Ты голосовой ассистент ChatGPT Live на умной колонке Яндекс Станция. Твои ответы озвучиваются вслух через динамик: говори кратко (1-2 предложения), живым разговорным тоном, без лишних вступлений и списков. У тебя есть полноценный выход в интернет (DuckDuckGo, курсы валют ЦБ РФ, криптобиржи, прогноз погоды), управление громкостью динамика и сменяемые голоса. Никогда не говори «у меня нет доступа в интернет». Если пользователь говорит «пока», «отбой», «стоп», «хватит» — вежливо ответь «Пока!» и завершай звонок."
+	if primeErr := p.sendRelaySystemText(primingPrompt); primeErr != nil {
+		p.report.Printf("Warning: cannot send system priming: %v", primeErr)
+	} else {
+		p.report.Print("Delivered session priming prompt to ChatGPT.")
+	}
 	if ctx.Err() != nil {
 		return complete(context.Cause(ctx))
 	}
@@ -820,6 +925,24 @@ func runCall(e *stationEpoch, sessionFile string, capture *stationCapture, setti
 	}
 	finishSetup()
 	e.report.Print("Voice media ready.")
+	p.lastActivity.Store(time.Now().Unix())
+	workers.Go(func() {
+		ticker := time.NewTicker(3 * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				last := p.lastActivity.Load()
+				if last > 0 && time.Now().Unix()-last > 30 {
+					p.report.Print("Session silence timeout (30s inactivity); ending call gracefully.")
+					p.cancel(errProtocolHangup)
+					return
+				}
+			}
+		}
+	})
 	workers.Go(func() {
 		if sendErr := e.output.send(ctx, p.mic, capture.input); sendErr != nil {
 			e.revoke(sendErr)

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -19,15 +20,100 @@ import (
 	"time"
 )
 
+func init() {
+	// Configure reliable DNS resolver directly using Yandex DNS (77.88.8.8) and Google DNS (8.8.8.8)
+	// to bypass broken Android netd/dnsmasq 127.0.0.1:53 resolver on rooted Yandex Station Mini.
+	net.DefaultResolver = &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{Timeout: 3 * time.Second}
+			servers := []string{
+				"77.88.8.8:53", // Yandex primary
+				"77.88.8.1:53", // Yandex secondary
+				"8.8.8.8:53",   // Google
+				"1.1.1.1:53",   // Cloudflare
+			}
+			var lastErr error
+			for _, s := range servers {
+				conn, err := d.DialContext(ctx, "udp", s)
+				if err == nil {
+					return conn, nil
+				}
+				lastErr = err
+			}
+			return nil, lastErr
+		},
+	}
+}
+
 var (
 	volumeMu     sync.Mutex
 	cachedVolume = -1
+
+	voiceMu     sync.Mutex
+	cachedVoice = ""
 
 	snippetRegex = regexp.MustCompile(`<a[^>]+class="result__snippet"[^>]*>(.*?)</a>`)
 	titleRegex   = regexp.MustCompile(`<a[^>]+class="result__a"[^>]*>(.*?)</a>`)
 	tagRegex     = regexp.MustCompile(`<[^>]+>`)
 	wsRegex      = regexp.MustCompile(`\s+`)
 )
+
+const voiceFile = "/data/yandex-station-chatgpt-voice/voice.name"
+
+var availableVoices = []string{"orbit", "vale", "breeze", "juniper", "sky", "cove", "ember", "sol", "maple", "spruce", "arbor"}
+
+func getSavedVoice() string {
+	voiceMu.Lock()
+	defer voiceMu.Unlock()
+
+	if cachedVoice != "" {
+		return cachedVoice
+	}
+
+	if data, err := os.ReadFile(voiceFile); err == nil {
+		v := strings.ToLower(strings.TrimSpace(string(data)))
+		for _, name := range availableVoices {
+			if v == name {
+				cachedVoice = v
+				return cachedVoice
+			}
+		}
+	}
+
+	cachedVoice = "orbit"
+	return cachedVoice
+}
+
+func saveVoice(name string) error {
+	voiceMu.Lock()
+	defer voiceMu.Unlock()
+
+	name = strings.ToLower(strings.TrimSpace(name))
+	valid := false
+	for _, v := range availableVoices {
+		if v == name {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		name = "orbit"
+	}
+
+	cachedVoice = name
+	_ = os.MkdirAll("/data/yandex-station-chatgpt-voice", 0755)
+	return os.WriteFile(voiceFile, []byte(name+"\n"), 0644)
+}
+
+func nextVoice(current string) string {
+	for i, v := range availableVoices {
+		if v == current {
+			return availableVoices[(i+1)%len(availableVoices)]
+		}
+	}
+	return "vale"
+}
 
 func cleanHTML(s string) string {
 	s = tagRegex.ReplaceAllString(s, " ")
@@ -145,10 +231,137 @@ func parseVolumeCommand(text string) (bool, int, int) {
 	return false, -1, 0
 }
 
-func detectSearchQuery(text string) (bool, string) {
-	lower := strings.ToLower(text)
+func parseVoiceCommand(text string) (bool, string, string) {
+	lower := strings.ToLower(strings.TrimSpace(text))
 
-	// Direct mentions of internet / search engines
+	// Inquiry about voices
+	if strings.Contains(lower, "какие есть голоса") || strings.Contains(lower, "какой у тебя голос") ||
+		strings.Contains(lower, "какие голоса доступны") || strings.Contains(lower, "список голосов") ||
+		strings.Contains(lower, "какой голос установлен") {
+		cur := getSavedVoice()
+		msg := fmt.Sprintf("Сейчас включен голос %s. Доступны: мужские Orbit, Breeze, Cove, Ember, Spruce, Arbor, и женские Vale, Juniper, Sky, Sol, Maple. Чтобы переключить, скажи «Смени голос» или назови конкретный.", cur)
+		return true, "", msg
+	}
+
+	// Next voice cycle
+	if strings.Contains(lower, "смени голос") || strings.Contains(lower, "поменяй голос") ||
+		strings.Contains(lower, "следующий голос") || strings.Contains(lower, "другой голос") ||
+		strings.Contains(lower, "переключи голос") {
+		cur := getSavedVoice()
+		next := nextVoice(cur)
+		msg := fmt.Sprintf("Переключаю голос на %s! При следующем вызове буду говорить им.", next)
+		return true, next, msg
+	}
+
+	// Gender presets
+	if strings.Contains(lower, "женский голос") || strings.Contains(lower, "голос девушк") || (strings.Contains(lower, "девушк") && strings.Contains(lower, "голос")) {
+		next := "vale"
+		msg := "Переключаю на выразительный женский голос Vale! Переключаюсь."
+		return true, next, msg
+	}
+	if strings.Contains(lower, "мужской голос") || strings.Contains(lower, "голос парн") || (strings.Contains(lower, "парн") && strings.Contains(lower, "голос")) {
+		next := "breeze"
+		msg := "Переключаю на живой мужской голос Breeze! Переключаюсь."
+		return true, next, msg
+	}
+
+	// Specific voice names
+	for _, name := range availableVoices {
+		if strings.Contains(lower, name) && (strings.Contains(lower, "голос") || strings.Contains(lower, "поставь") || strings.Contains(lower, "включи") || strings.Contains(lower, "выбери")) {
+			msg := fmt.Sprintf("Переключаю голос на %s. При следующем вызове заговорю новым голосом!", name)
+			return true, name, msg
+		}
+	}
+
+	return false, "", ""
+}
+
+func handleSetVoice(argsJSON string) (string, error) {
+	var args struct {
+		Voice string `json:"voice"`
+	}
+	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil || args.Voice == "" {
+		args.Voice = strings.Trim(strings.TrimSpace(argsJSON), `"{}`)
+	}
+	voice := strings.ToLower(strings.TrimSpace(args.Voice))
+	if voice == "" {
+		voice = nextVoice(getSavedVoice())
+	}
+	if err := saveVoice(voice); err != nil {
+		return "", fmt.Errorf("failed to save voice: %w", err)
+	}
+	return fmt.Sprintf(`{"status":"voice_changed","voice":%q,"message":"Голос изменен на %s. При следующем вызове буду говорить им."}`, voice, voice), nil
+}
+
+func parseHangupCommand(text string) (bool, string) {
+	lower := strings.ToLower(strings.TrimSpace(text))
+	lower = strings.Trim(lower, ".!?,;:")
+
+	farewells := map[string]string{
+		"пока":               "Пока! Хорошего дня!",
+		"пока пока":          "Пока-пока!",
+		"пока-пока":          "Пока-пока!",
+		"до свидания":        "До свидания!",
+		"до встречи":         "До встречи!",
+		"до связи":           "До связи!",
+		"отбой":              "Отбой!",
+		"стоп":               "Останавливаюсь.",
+		"хватит":             "Понял, закругляюсь.",
+		"заверши сессию":     "Завершаю сессию, до встречи!",
+		"завершить сессию":   "Завершаю сессию, до встречи!",
+		"заверши разговор":   "Завершаю разговор. До связи!",
+		"завершить разговор": "Завершаю разговор. До связи!",
+		"отключись":          "Отключаюсь!",
+		"выключись":          "Отключаюсь!",
+		"спасибо пока":       "Пожалуйста! До связи!",
+		"спасибо, пока":      "Пожалуйста! До связи!",
+		"все пока":           "До скорого!",
+		"всё пока":           "До скорого!",
+		"конец связи":        "Конец связи!",
+	}
+
+	if msg, ok := farewells[lower]; ok {
+		return true, msg
+	}
+
+	for phrase, msg := range farewells {
+		if strings.HasPrefix(lower, phrase) || strings.HasSuffix(lower, phrase) {
+			return true, msg
+		}
+	}
+
+	triggers := []string{
+		"заверши сесси", "завершить сесси", "заверши разговор", "завершить разговор",
+		"закрой разговор", "закрой сесси", "отключи сесси", "останови сесси",
+	}
+	for _, tr := range triggers {
+		if strings.Contains(lower, tr) {
+			return true, "Завершаю разговор. До связи!"
+		}
+	}
+
+	if len([]rune(lower)) <= 15 {
+		if strings.HasPrefix(lower, "пока") || strings.HasPrefix(lower, "отбой") ||
+			strings.HasPrefix(lower, "стоп") || strings.HasPrefix(lower, "хватит") {
+			return true, "Пока!"
+		}
+	}
+
+	return false, ""
+}
+
+func detectSearchQuery(text string) (bool, string) {
+	lower := strings.ToLower(strings.TrimSpace(text))
+
+	// 0. Capability inquiry
+	if (strings.Contains(lower, "доступ") && strings.Contains(lower, "интернет")) ||
+		(strings.Contains(lower, "duckduckgo") && (strings.Contains(lower, "доступ") || strings.Contains(lower, "можешь") || strings.Contains(lower, "умеешь") || strings.Contains(lower, "есть"))) ||
+		strings.Contains(lower, "у тебя есть интернет") || strings.Contains(lower, "ты в интернете") ||
+		strings.Contains(lower, "ты подключен к интернету") || strings.Contains(lower, "ты подключена к интернету") {
+		return true, strings.TrimSpace(text)
+	}
+
+	// 1. Direct search mentions
 	if strings.Contains(lower, "интернет") || strings.Contains(lower, "duckduckgo") ||
 		strings.Contains(lower, "дакдакго") || strings.Contains(lower, "дактдакго") ||
 		strings.Contains(lower, "в гугле") || strings.Contains(lower, "в яндексе") ||
@@ -156,7 +369,7 @@ func detectSearchQuery(text string) (bool, string) {
 		return true, strings.TrimSpace(text)
 	}
 
-	// Explicit search triggers
+	// 2. Explicit triggers
 	reExplicit := regexp.MustCompile(`(?:найди|поищи|посмотри|глянь|пробей|узнай|проверь|досмотри|поиск)\s*(?:в интернете|в сети|в новостях)?\s*(.*)`)
 	if m := reExplicit.FindStringSubmatch(lower); len(m) > 1 {
 		q := strings.TrimSpace(m[1])
@@ -165,13 +378,25 @@ func detectSearchQuery(text string) (bool, string) {
 		}
 	}
 
-	// Keywords requiring internet / fresh data
+	// 3. Question words requiring fresh info
+	questionTriggers := []string{
+		"кто такой", "кто такая", "кто такие", "что такое", "где находится",
+		"когда выйдет", "когда был", "когда будет", "сколько стоит", "какая цена",
+		"что случилось", "что произошло", "какой счет", "кто выиграл", "кто победил",
+		"последние новости", "свежие новости", "что нового", "какой сейчас",
+	}
+	for _, qtr := range questionTriggers {
+		if strings.Contains(lower, qtr) {
+			return true, strings.TrimSpace(text)
+		}
+	}
+
+	// 4. Keywords requiring fresh data
 	triggers := []string{
-		"курс", "доллар", "евро", "юан", "биткоин", "bitcoin", "btc", "крипт", "валют", "акци", "цена",
+		"курс", "доллар", "евро", "юан", "биткоин", "bitcoin", "btc", "крипт", "валют", "акци",
 		"погод", "температур", "прогноз", "градус", "дождь", "снег",
-		"новост", "событи", "произошл", "случилос", "что нового", "дайджест", "сводка",
+		"новост", "событи", "дайджест", "сводка",
 		"число", "день недели", "который час", "сколько времени", "какая дата",
-		"кто такой", "что такое", "где находится", "расскажи про", "биография",
 	}
 
 	for _, trig := range triggers {
@@ -532,8 +757,24 @@ func getSessionUpdateMessage() string {
 		},
 		{
 			"type": "function",
+			"name": "set_voice",
+			"description": "Смена голоса ассистента на Станции (orbit, vale, breeze, juniper, sky, cove, ember, sol). Используй, когда пользователь просит изменить голос или включить женский/мужской голос.",
+			"parameters": map[string]any{
+				"type": "object",
+				"properties": map[string]any{
+					"voice": map[string]any{
+						"type":        "string",
+						"enum":        availableVoices,
+						"description": "Имя голоса: orbit, vale, breeze, juniper, sky, cove, ember, sol, maple, spruce, arbor",
+					},
+				},
+				"required": []string{"voice"},
+			},
+		},
+		{
+			"type": "function",
 			"name": "search_web",
-			"description": "Поиск актуальной информации в интернете: свежие новости, курс валют и акций, погода, факты и события сегодняшнего дня.",
+			"description": "Поиск актуальной информации в интернете через DuckDuckGo, курсы валют ЦБ РФ, криптобиржи и прогноз погоды. Вызывай, когда пользователю нужны факты, новости, курсы или прогноз.",
 			"parameters": map[string]any{
 				"type": "object",
 				"properties": map[string]any{
@@ -545,12 +786,20 @@ func getSessionUpdateMessage() string {
 				"required": []string{"query"},
 			},
 		},
+		{
+			"type": "function",
+			"name": "hang_up",
+			"description": "Завершение текущего разговора и отключение звонка на колонке. Вызывай, когда пользователь прощается ('пока', 'до свидания', 'отбой', 'хватит', 'стоп') или просит закончить разговор.",
+			"parameters": map[string]any{
+				"type": "object",
+			},
+		},
 	}
 
 	payload := map[string]any{
 		"type": "session.update",
 		"session": map[string]any{
-			"instructions": "Ты умный голосовой помощник на Яндекс Станции Мини. Тебя зовут ChatGPT. Ты общаешься голосом через динамик колонки. Отвечай кратко, емко и по существу (1-2 предложения), без лишних вступительных фраз. Если пользователь просит найти свежие новости, актуальный курс доллара/евро, погоду или информацию из интернета, обязательно вызывай search_web. Если пользователь просит сделать громче, тише или задать громкость, обязательно вызывай set_volume.",
+			"instructions": "Ты умный голосовой помощник на Яндекс Станции Мини. Тебя зовут ChatGPT. Ты общаешься только голосом через динамик колонки. Отвечай кратко, емко и по существу (1-2 предложения), без списков и вступительных фраз. У тебя есть постоянный выход в интернет (search_web), управление громкостью (set_volume), переключение голосов (set_voice) и завершение разговора (hang_up). Если вопрос касается текущих данных, новостей, погоды или незнакомых фактов — всегда вызывай search_web. Никогда не говори 'у меня нет доступа в интернет'. Если пользователь прощается — вежливо скажи короткое 'Пока!' и вызови hang_up.",
 			"tools":        tools,
 			"tool_choice":  "auto",
 		},
