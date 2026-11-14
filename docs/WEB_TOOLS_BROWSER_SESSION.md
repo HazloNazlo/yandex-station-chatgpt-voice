@@ -25,8 +25,9 @@ This gives the voice assistant useful tool-like behavior, but it is important to
 - `getSystemInstructionMessage` is also currently unused.
 - `parseToolCalls` expects `response.function_call_arguments.done`, `response.output_item.done`, and `response.done`; the handler then sends `conversation.item.create/function_call_output` and `response.create`.
 
-The mismatch is important: those event names and the `session.update` tool schema are the public Realtime function-calling shape. The active `/realtime/wm` route is a separate private ChatGPT web transport. A third-party implementation of that private transport documents that direct `/wm` accepts only a small reserved set of device-tool IDs (`timer`, `stopwatch`, `precise_location`, `led`) and rejects arbitrary application tool IDs/schemas. Its docs also state that web search and other upstream capabilities may vary by account and are not exposed as a stable client feature switch. This is reverse-engineered evidence, not an OpenAI protocol guarantee:
+The mismatch is important: those event names and the `session.update` tool schema are the public Realtime function-calling shape. The active `/realtime/wm` route is a separate private ChatGPT web transport. The third-party experimental SDK documentation for this private route says that `client_tools` must remain empty and that `/wm` only accepts the reserved device-tool IDs `timer`, `stopwatch`, `precise_location`, and `led`; arbitrary application schemas are rejected. It also distinguishes this direct voice-only route from the desktop app-server mediation path, whose handoff events can reach server-owned tools but requires a separate Node/Bun + `codex` process and is not emitted on the direct `/wm` DataChannel. This is reverse-engineered, unofficial documentation, not an OpenAI protocol guarantee:
 - https://loginwithchatgpt.dev/docs/guides/realtime-voice
+- https://loginwithchatgpt.dev/docs/reference/core
 
 ### Why internet access feels unreliable
 
@@ -123,11 +124,12 @@ References:
 
 ### Weather provider
 
-Replace the single-word wttr.in parser with geocoding plus a structured forecast provider. Open-Meteo is a strong no-key option for non-commercial use: it publishes JSON current/forecast endpoints and a geocoding API; its free service requires attribution under CC BY 4.0. Confirm current terms and attribution before release.
+Replace the single-word wttr.in parser with geocoding plus a structured forecast provider. Open-Meteo exposes current and multi-day forecast data and geocoding in JSON, without requiring an API key for its free tier. The free service is limited to non-commercial use (up to 10,000 calls/day) and requires CC BY 4.0 attribution; commercial use requires a separate arrangement. This is a good fit only if the project's use complies with those terms.
 
 References:
 - https://open-meteo.com/
 - https://open-meteo.com/en/docs
+- https://open-meteo.com/en/terms
 
 ### URL opening and page safety
 
@@ -155,7 +157,9 @@ Because direct `/wm` does not provide arbitrary client function schemas, the fir
 7. Relay a compact evidence packet into the existing voice conversation. It must say which sources were used, include URLs, and distinguish “no results” from “network error”.
 8. Preserve cancellation: a new user turn, Alice priority, or call end cancels the outstanding tool request and prevents late results from being relayed.
 
-This is still heuristic routing. If true semantic tool selection by the same GPT model is a hard requirement, it needs a separately validated mechanism. The direct `/wm` route does not expose arbitrary custom function schemas; a second private ChatGPT text-agent endpoint or a desktop app-server bridge would be a new, experimental integration and must be proven with the user's own session before becoming a dependency. It should not be represented as supported by the current DataChannel protocol.
+This is still heuristic routing. If true semantic tool selection by the same GPT model is a hard requirement, there is one adjacent research path worth evaluating before inventing a second model: the unofficial desktop-style app-server bridge described by the experimental SDK. Its docs say it can route native `handoff_request` items to arbitrary server-owned tools, but it uses a separate private mediation protocol, a Node/Bun server, and the `codex` executable; those handoff items are not emitted on direct browser `/wm`. It therefore is not a drop-in option for this Go daemon and needs a dedicated proof of concept using the user's own signed-in account. It does not require us to switch the audio transport or assume that a direct `/wm` DataChannel supports arbitrary custom tools, but it may introduce a separate Codex-session entitlement and process dependency. Verify those requirements and terms before choosing it. See https://loginwithchatgpt.dev/docs/guides/realtime-voice and https://loginwithchatgpt.dev/docs/reference/core.
+
+The direct `/wm` path itself does not expose arbitrary custom function schemas. Do not represent an app-server bridge or a local transcript router as native model function calling. Keep the local tool gateway as the reliable first implementation until the alternative has been demonstrated end to end.
 
 ## Security and reliability changes required
 
