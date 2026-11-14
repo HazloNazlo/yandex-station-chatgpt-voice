@@ -74,3 +74,79 @@ func TestCleanHTML(t *testing.T) {
 		t.Errorf("cleanHTML(%q) = %q; want %q", input, got, want)
 	}
 }
+
+func TestParseHangupCommand(t *testing.T) {
+	tests := []struct {
+		input      string
+		wantHangup bool
+	}{
+		// Should NOT hang up (false positive risks)
+		{"покажи погоду в Москве", false},
+		{"покажи курс доллара", false},
+		{"покажи последние новости", false},
+		{"пока что всё нормально", false},
+		{"пока не знаю", false},
+		{"пока ты ищешь, я схожу за чаем", false},
+		{"хватит ли мне 100 рублей?", false},
+		{"автостопом по галактике", false},
+		{"покажешь фокус?", false},
+
+		// SHOULD hang up (true farewells)
+		{"пока", true},
+		{"пока-пока", true},
+		{"ну пока", true},
+		{"ладно пока", true},
+		{"ну всё, пока!", true},
+		{"до свидания", true},
+		{"до встречи", true},
+		{"до связи", true},
+		{"стоп", true},
+		{"хватит", true},
+		{"отбой", true},
+		{"заверши сессию", true},
+		{"завершить сессию", true},
+		{"заверши разговор", true},
+		{"завершить звонок", true},
+		{"отключись", true},
+		{"выключись", true},
+		{"конец связи", true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got, _ := parseHangupCommand(tc.input)
+			if got != tc.wantHangup {
+				t.Errorf("parseHangupCommand(%q) = %v; want %v", tc.input, got, tc.wantHangup)
+			}
+		})
+	}
+}
+
+func TestCleanSearchQuery(t *testing.T) {
+	tests := []struct {
+		input string
+		want  string
+	}{
+		{
+			"Расскажи мне , посмотри в интернете, в Википедии историю появления породы собаки русский спаниель и расскажи .",
+			"историю появления породы собаки русский спаниель",
+		},
+		{
+			"посмотри в интернете кто президент Франции",
+			"кто президент франции",
+		},
+		{
+			"найди в википедии квантовый процессор",
+			"квантовый процессор",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.input, func(t *testing.T) {
+			got := cleanSearchQuery(tc.input)
+			if got != tc.want {
+				t.Errorf("cleanSearchQuery(%q) = %q; want %q", tc.input, got, tc.want)
+			}
+		})
+	}
+}

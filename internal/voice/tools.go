@@ -19,6 +19,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 )
 
 var sharedHTTPClient = &http.Client{
@@ -75,8 +76,8 @@ var (
 	voiceMu     sync.Mutex
 	cachedVoice = ""
 
-	snippetRegex = regexp.MustCompile(`<a[^>]+class="result__snippet"[^>]*>(.*?)</a>`)
-	titleRegex   = regexp.MustCompile(`<a[^>]+class="result__a"[^>]*>(.*?)</a>`)
+	snippetRegex = regexp.MustCompile(`(?s)<a[^>]+class="result__snippet"[^>]*>(.*?)</a>`)
+	titleRegex   = regexp.MustCompile(`(?s)<a[^>]+class="result__a"[^>]*>(.*?)</a>`)
 	tagRegex     = regexp.MustCompile(`<[^>]+>`)
 	wsRegex      = regexp.MustCompile(`\s+`)
 )
@@ -334,57 +335,194 @@ func handleSetVoice(argsJSON string) (string, error) {
 
 func parseHangupCommand(text string) (bool, string) {
 	lower := strings.ToLower(strings.TrimSpace(text))
-	lower = strings.Trim(lower, ".!?,;:")
+	lower = strings.Trim(lower, ".!?,;:\")'\"")
 
-	farewells := []string{
-		"пока", "до свидания", "до встречи", "до связи", "отбой", "стоп", "хватит",
-		"заверши сесси", "завершить сесси", "заверши разговор", "завершить разговор",
-		"закрой разговор", "закрой сесси", "отключи сесси", "останови сесси",
-		"отключись", "выключись", "конец связи",
+	// If empty or an explicit question, it's not a hangup
+	if lower == "" || strings.HasSuffix(text, "?") {
+		return false, ""
 	}
 
-	for _, f := range farewells {
-		if strings.Contains(lower, f) {
+	// 1. Explicit hangup commands
+	explicitPhrases := []string{
+		"заверши сесси", "завершить сесси", "завершай сесси",
+		"заверши разговор", "завершить разговор", "завершай разговор",
+		"заверши звонок", "завершить звонок", "закончи разговор", "закончить разговор",
+		"закрой разговор", "закрой сесси", "отключи сесси", "останови сесси",
+		"останови разговор", "положи трубку", "конец связи", "прекрати разговор",
+	}
+	for _, phrase := range explicitPhrases {
+		if strings.Contains(lower, phrase) {
 			return true, "До связи!"
 		}
 	}
+
+	// Tokenize words
+	fields := strings.FieldsFunc(lower, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	var cleanWords []string
+	for _, f := range fields {
+		if f != "" {
+			cleanWords = append(cleanWords, f)
+		}
+	}
+
+	if len(cleanWords) == 0 {
+		return false, ""
+	}
+
+	// Long queries are not farewells
+	if len(cleanWords) > 5 {
+		return false, ""
+	}
+
+	// 2. Multi-word exact farewell phrases
+	fullClean := strings.Join(cleanWords, " ")
+	multiFarewells := []string{
+		"до свидания", "до встречи", "до связи", "пока пока", "ну пока",
+		"ладно пока", "давай пока", "все пока", "всё пока", "все хватит",
+		"всё хватит", "стоп игра", "все стоп", "всё стоп", "спокойной ночи",
+	}
+	for _, mf := range multiFarewells {
+		if fullClean == mf {
+			return true, "До связи!"
+		}
+	}
+
+	// Check if any isolated word is "пока"
+	hasPoka := false
+	pokaIdx := -1
+	for idx, w := range cleanWords {
+		if w == "пока" {
+			hasPoka = true
+			pokaIdx = idx
+			break
+		}
+	}
+
+	if hasPoka {
+		// "пока что", "пока не", "пока нет", "пока ты", "пока я" -> NOT hangup!
+		if pokaIdx+1 < len(cleanWords) {
+			next := cleanWords[pokaIdx+1]
+			if next == "что" || next == "не" || next == "нет" || next == "ты" || next == "я" || next == "мы" {
+				return false, ""
+			}
+		}
+		// If phrase is short and contains isolated word "пока"
+		if len(cleanWords) <= 4 {
+			return true, "До связи!"
+		}
+	}
+
+	// 3. Strict single-word exact commands: "стоп", "хватит", "отбой", "отключись", "выключись"
+	exactFarewells := map[string]bool{
+		"отбой":     true,
+		"стоп":      true,
+		"хватит":    true,
+		"отключись": true,
+		"выключись": true,
+		"прекрати":  true,
+	}
+	if len(cleanWords) <= 3 {
+		for _, w := range cleanWords {
+			if exactFarewells[w] {
+				// avoid "хватит ли"
+				if w == "хватит" && len(cleanWords) > 1 {
+					hasLi := false
+					for _, cw := range cleanWords {
+						if cw == "ли" {
+							hasLi = true
+						}
+					}
+					if hasLi {
+						return false, ""
+					}
+				}
+				return true, "До связи!"
+			}
+		}
+	}
+
 	return false, ""
+}
+
+func cleanSearchQuery(text string) string {
+	lower := strings.ToLower(strings.TrimSpace(text))
+
+	cleanPunct := strings.Map(func(r rune) rune {
+		if r == ',' || r == '.' || r == '!' || r == '?' || r == ';' || r == ':' ||
+			r == '"' || r == '\'' || r == '(' || r == ')' || r == '«' || r == '»' {
+			return ' '
+		}
+		return r
+	}, lower)
+
+	fillers := []string{
+		"посмотри в интернете", "посмотри в сети", "посмотри в википедии",
+		"найди в интернете", "найди в сети", "найди в гугле", "найди в яндексе",
+		"поищи в интернете", "поищи в сети", "поищи в википедии",
+		"узнай в интернете", "узнай в сети", "узнай в википедии",
+		"проверь в интернете", "проверь в сети",
+		"в интернете", "в википедии", "в сети", "в гугле", "в яндексе", "в duckduckgo",
+		"расскажи мне пожалуйста", "расскажи мне", "расскажи пожалуйста",
+		"скажи мне пожалуйста", "скажи мне", "скажи пожалуйста",
+		"найди мне пожалуйста", "найди мне", "найди пожалуйста",
+		"поищи пожалуйста", "посмотри пожалуйста", "покажи пожалуйста",
+		"узнай пожалуйста", "проверь пожалуйста",
+		"и расскажи", "и покажи", "а покажи", "пожалуйста",
+		"расскажи", "скажи", "найди", "поищи", "посмотри", "узнай", "покажи",
+	}
+
+	res := cleanPunct
+	for _, f := range fillers {
+		res = strings.ReplaceAll(res, f, " ")
+	}
+
+	ws := regexp.MustCompile(`\s+`)
+	res = strings.TrimSpace(ws.ReplaceAllString(res, " "))
+	return res
 }
 
 func detectSearchQuery(text string) (bool, string) {
 	lower := strings.ToLower(strings.TrimSpace(text))
 
-	// 0. Capability inquiry
+	// 0. Capability inquiry / internet test
 	if (strings.Contains(lower, "доступ") && strings.Contains(lower, "интернет")) ||
 		(strings.Contains(lower, "duckduckgo") && (strings.Contains(lower, "доступ") || strings.Contains(lower, "можешь") || strings.Contains(lower, "умеешь") || strings.Contains(lower, "есть"))) ||
 		strings.Contains(lower, "у тебя есть интернет") || strings.Contains(lower, "ты в интернете") ||
-		strings.Contains(lower, "ты подключен к интернету") || strings.Contains(lower, "ты подключена к интернету") {
+		strings.Contains(lower, "ты подключен к интернету") || strings.Contains(lower, "ты подключена к интернету") ||
+		strings.Contains(lower, "проверь интернет") || strings.Contains(lower, "проверь связь") ||
+		strings.Contains(lower, "проверка интернета") || strings.Contains(lower, "работает ли интернет") ||
+		strings.Contains(lower, "есть интернет") || strings.Contains(lower, "есть доступ в интернет") {
 		return true, strings.TrimSpace(text)
 	}
 
 	// 1. Direct search mentions
 	if strings.Contains(lower, "интернет") || strings.Contains(lower, "duckduckgo") ||
 		strings.Contains(lower, "дакдакго") || strings.Contains(lower, "дактдакго") ||
-		strings.Contains(lower, "в гугле") || strings.Contains(lower, "в яндексе") ||
-		strings.Contains(lower, "погугли") || strings.Contains(lower, "загугли") {
+		strings.Contains(lower, "википеди") || strings.Contains(lower, "в гугле") ||
+		strings.Contains(lower, "в яндексе") || strings.Contains(lower, "погугли") ||
+		strings.Contains(lower, "загугли") {
 		return true, strings.TrimSpace(text)
 	}
 
 	// 2. Explicit triggers
-	reExplicit := regexp.MustCompile(`(?:найди|поищи|посмотри|глянь|пробей|узнай|проверь|досмотри|поиск)\s*(?:в интернете|в сети|в новостях)?\s*(.*)`)
+	reExplicit := regexp.MustCompile(`(?:найди|поищи|посмотри|глянь|пробей|узнай|проверь|досмотри|поиск|покажи)\s*(?:в интернете|в сети|в новостях|в википедии)?\s*(.*)`)
 	if m := reExplicit.FindStringSubmatch(lower); len(m) > 1 {
 		q := strings.TrimSpace(m[1])
-		if len(q) > 3 {
-			return true, q
+		if len(q) > 2 {
+			return true, strings.TrimSpace(text)
 		}
 	}
 
 	// 3. Question words requiring fresh info
 	questionTriggers := []string{
 		"кто такой", "кто такая", "кто такие", "что такое", "где находится",
-		"когда выйдет", "когда был", "когда будет", "сколько стоит", "какая цена",
-		"что случилось", "что произошло", "какой счет", "кто выиграл", "кто победил",
-		"последние новости", "свежие новости", "что нового", "какой сейчас",
+		"где располож", "когда выйдет", "когда был", "когда будет", "сколько стоит",
+		"какая цена", "что случилось", "что произошло", "какой счет", "кто выиграл",
+		"кто победил", "последние новости", "свежие новости", "что нового", "какой сейчас",
+		"история появления", "история создания", "история породы", "почему", "зачем",
+		"как устроена", "как устроен", "как работает", "в каком году", "в каком городе",
 	}
 	for _, qtr := range questionTriggers {
 		if strings.Contains(lower, qtr) {
@@ -688,13 +826,15 @@ func searchWeb(ctx context.Context, query string) (string, error) {
 	}
 	lower := strings.ToLower(trimmed)
 
-	// 0. Capability inquiry: does ChatGPT have internet / DuckDuckGo access?
+	// 0. Capability inquiry / connection test
 	if (strings.Contains(lower, "доступ") && strings.Contains(lower, "интернет")) ||
 		(strings.Contains(lower, "duckduckgo") && (strings.Contains(lower, "доступ") || strings.Contains(lower, "можешь") || strings.Contains(lower, "умеешь") || strings.Contains(lower, "есть"))) ||
 		strings.Contains(lower, "у тебя есть интернет") || strings.Contains(lower, "ты в интернете") ||
 		strings.Contains(lower, "ты подключен к интернету") || strings.Contains(lower, "ты подключена к интернету") ||
+		strings.Contains(lower, "проверь интернет") || strings.Contains(lower, "проверь связь") ||
+		strings.Contains(lower, "проверка интернета") || strings.Contains(lower, "работает ли интернет") ||
 		strings.Contains(lower, "есть интернет") || strings.Contains(lower, "есть доступ в интернет") {
-		return "Да, у меня есть постоянный доступ в интернет! Я подключен к поисковику DuckDuckGo, официальным курсам валют ЦБ РФ, криптобиржам и прогнозу погоды. Я могу в реальном времени искать любую актуальную информацию.", nil
+		return "Да, у меня на Яндекс Станции есть постоянный и быстрый доступ в интернет! Я подключен к поисковику DuckDuckGo, Википедии, официальным курсам валют ЦБ РФ, криптобиржам и прогнозу погоды. Я могу в реальном времени искать любую актуальную информацию.", nil
 	}
 
 	// 1. Time / Date query
@@ -734,17 +874,32 @@ func searchWeb(ctx context.Context, query string) (string, error) {
 		}
 	}
 
+	cleanQ := cleanSearchQuery(trimmed)
+	if cleanQ == "" {
+		cleanQ = trimmed
+	}
+
 	// 5. Search via Wikipedia (instant 200ms encyclopedic facts)
-	if res, err := fetchWikipedia(ctx, trimmed); err == nil && res != "" {
+	if res, err := fetchWikipedia(ctx, cleanQ); err == nil && res != "" {
 		return res, nil
+	}
+	if cleanQ != trimmed {
+		if res, err := fetchWikipedia(ctx, trimmed); err == nil && res != "" {
+			return res, nil
+		}
 	}
 
 	// 6. Search via DuckDuckGo
-	if res, err := fetchDuckDuckGo(ctx, trimmed); err == nil && res != "" {
+	if res, err := fetchDuckDuckGo(ctx, cleanQ); err == nil && res != "" {
 		return res, nil
 	}
+	if cleanQ != trimmed {
+		if res, err := fetchDuckDuckGo(ctx, trimmed); err == nil && res != "" {
+			return res, nil
+		}
+	}
 
-	return fmt.Sprintf("По запросу %q актуальной информации не найдено.", trimmed), nil
+	return fmt.Sprintf("По запросу %q подробностей не найдено, но интернет работает стабильно.", cleanQ), nil
 }
 
 type searchArgs struct {

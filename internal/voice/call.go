@@ -298,6 +298,7 @@ func (p *peer) sendRelayText(text string) error {
 }
 
 func (p *peer) handleMessage(data []byte) {
+	p.lastActivity.Store(time.Now().Unix())
 	//nolint:errorlint // Only the exact sentinel is benign; wrapped or joined failures must remain failures.
 	if p.ctx.Err() != nil && context.Cause(p.ctx) != errProtocolHangup {
 		return
@@ -467,7 +468,7 @@ func (p *peer) handleMessage(data []byte) {
 								return
 							}
 							p.report.Printf("Search completed. Sending relay text to ChatGPT...")
-							relayPrompt := fmt.Sprintf("Срочно озвучь пользователю точный ответ на его вопрос %q, используя эти проверенные факты:\n%s", query, results)
+							relayPrompt := fmt.Sprintf("[Данные из интернета]: Ты голосовой ассистент на умной колонке Яндекс Станция. У тебя есть постоянный доступ в интернет. Используй эти проверенные данные, чтобы емко и четко ответить пользователю на его вопрос %q:\n%s", query, results)
 							if p.audio != nil {
 								p.audio.flushPlayback()
 							}
@@ -882,9 +883,13 @@ func runCall(e *stationEpoch, sessionFile string, capture *stationCapture, setti
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
+				if p.audio != nil && p.audio.isPlaying() {
+					p.lastActivity.Store(time.Now().Unix())
+					continue
+				}
 				last := p.lastActivity.Load()
-				if last > 0 && time.Now().Unix()-last > 30 {
-					p.report.Print("Session silence timeout (30s inactivity); ending call gracefully.")
+				if last > 0 && time.Now().Unix()-last > 90 {
+					p.report.Print("Session silence timeout (90s inactivity); ending call gracefully.")
 					p.cancel(errProtocolHangup)
 					return
 				}

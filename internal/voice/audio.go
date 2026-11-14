@@ -71,6 +71,7 @@ type audio struct {
 	stopping      atomic.Bool
 	current       playbackBlock
 	currentAt     int
+	lastAudioTime atomic.Int64
 }
 
 func newAudio(epoch *stationEpoch) *audio {
@@ -190,6 +191,7 @@ func (a *audio) callback(output, _ []byte, frames uint32) {
 		binary.LittleEndian.PutUint16(output[i*4:], uint16(left))
 		binary.LittleEndian.PutUint16(output[i*4+2:], uint16(right))
 		a.currentAt++
+		a.lastAudioTime.Store(time.Now().Unix())
 	}
 	if !a.epoch.allowed() {
 		clear(output)
@@ -285,6 +287,13 @@ func (a *audio) flushPlayback() {
 		default:
 		}
 	}
+}
+
+func (a *audio) isPlaying() bool {
+	if a == nil {
+		return false
+	}
+	return time.Now().Unix()-a.lastAudioTime.Load() < 2 || len(a.playback) > 0
 }
 
 func cuePCM(frequency float64) []int16 {
@@ -403,6 +412,7 @@ func (a *audio) receive(ctx context.Context, track *webrtc.TrackRemote) (result 
 			}
 			nextTimestamp = sample.PacketTimestamp + uint32(n)
 			havePacket = true
+			a.lastAudioTime.Store(time.Now().Unix())
 			a.queueDecoded(pcm[:n*2])
 		}
 		return nil
