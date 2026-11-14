@@ -18,6 +18,26 @@ This can avoid a Developer API key and API-project pay-as-you-go billing. OpenAI
 - https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan
 - https://help.openai.com/en/articles/20001275-chatgpt-work-and-codex
 
+### ChatGPT Free plan: does it work without an upgrade?
+
+As of 14 November 2026, OpenAI's current Help Center says Codex is included across ChatGPT plans, including **Free** and Go; usage limits vary by plan. The current pricing page lists Free at $0/month with limited Codex capability (GPT-6 Luna at Standard speed in the desktop app, subject to rollout). This is a material change from older Codex documentation that described paid-plan-only access.
+
+However, Free is not equivalent to Plus:
+
+- Codex Cloud is explicitly **not included** with Free or Go.
+- Free usage is limited; do not assume a large or continuous voice-assistant allowance.
+- The pricing page currently calls out GPT-6 Luna in the desktop app for Free, subject to rollout. It does not promise every Codex model, surface, or third-party app-server integration on every Free account.
+- The proposed bridge uses a self-hosted Codex app-server process on the VPS, not OpenAI-managed Codex Cloud. That is why it may be possible without a paid plan, but the exact App Server + Sign in with ChatGPT + experimental realtime handoff combination still needs an account-level PoC.
+- The Sign in with ChatGPT plan-usage preview is documented for open-source and locally hosted apps. OpenAI says paid or remotely hosted app offerings need to follow its access requirements and submit an interest form. A private VM used by the owner is not the same as selling a hosted service to other users, but the deployment and registration should be checked against the current self-hosted VM guidance.
+
+Therefore: **do not upgrade just to start the PoC**. First try the account's Free entitlement using the official ChatGPT sign-in / plan-usage consent flow and a harmless test tool. The test passes only if the OAuth grant includes `chatgpt.tokens.use.direct`, the selected execution model completes a real inference, and the realtime bridge emits a native handoff. If any of those checks fail, diagnose the exact eligibility or rollout error before considering a paid plan.
+
+Sources:
+- Codex availability, including Free and Go; Cloud exclusion: https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan
+- Current Free plan capability: https://learn.chatgpt.com/docs/pricing
+- Sign in with ChatGPT scope, open-source / locally hosted app scope, and remote-hosted app requirements: https://developers.openai.com/siwc/token-sharing-open-source
+- App Server OAuth setup: https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server
+
 **Important maturity boundary:** Codex App Server itself is an OpenAI-documented, open-source JSON-RPC server. The specific realtime voice extension and event names used by the bridge (--enable realtime_conversation, thread/realtime/start, handoff_request, etc.) are experimental/private and are not documented as a stable public voice API. The third-party SDK is a useful implementation reference, not an OpenAI-supported integration contract.
 
 ## The three layers
