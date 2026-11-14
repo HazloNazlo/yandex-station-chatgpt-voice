@@ -25,7 +25,7 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media/samplebuilder"
 )
 
-const playbackQueueFrames = 12
+const playbackQueueFrames = 30
 const stereoFrameBytes = stereoChannels * pcmSampleBytes
 
 const captureSampleRate = 16000
@@ -37,7 +37,7 @@ const maxOpusSamples = 5760
 const playbackDrainTimeout = 2 * time.Second
 const cueTimeout = 2 * time.Second
 const cueVolume = 0.3
-const playbackGain = 1.78 // +5 dB boost to match Alice's native volume level
+const playbackGain = 1.0 // Unity gain ensures native hardware AEC (vqe_0) cancellation operates cleanly without distortion or clipping
 const readyCueFrequency = 880
 const endCueFrequency = 440
 

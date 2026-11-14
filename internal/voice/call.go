@@ -467,6 +467,9 @@ func (p *peer) handleMessage(data []byte) {
 								return
 							}
 							p.report.Printf("Search completed. Sending relay text to ChatGPT...")
+							if p.audio != nil {
+								p.audio.flushPlayback()
+							}
 							relayPrompt := fmt.Sprintf("[Данные из интернета]: Ты голосовой ассистент на умной колонке Яндекс Станция. У тебя есть постоянный доступ в интернет. Используй эти проверенные данные, чтобы емко и четко ответить пользователю на его вопрос %q:\n%s", query, results)
 							if err := p.sendRelayText(relayPrompt); err != nil {
 								p.report.Printf("Failed to send relay search: %v", err)

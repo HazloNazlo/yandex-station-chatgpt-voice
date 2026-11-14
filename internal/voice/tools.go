@@ -337,12 +337,12 @@ func parseHangupCommand(text string) (bool, string) {
 	lower := strings.ToLower(strings.TrimSpace(text))
 	lower = strings.Trim(lower, ".!?,;:\")'\"")
 
-	// If empty or an explicit question, it's not a hangup
+	// If empty or an explicit question, it's not a farewell
 	if lower == "" || strings.HasSuffix(text, "?") {
 		return false, ""
 	}
 
-	// 1. Explicit hangup commands
+	// 1. Explicit hangup / termination commands (exact phrases or prefixes)
 	explicitPhrases := []string{
 		"заверши сесси", "завершить сесси", "завершай сесси",
 		"заверши разговор", "завершить разговор", "завершай разговор",
@@ -367,22 +367,48 @@ func parseHangupCommand(text string) (bool, string) {
 			cleanWords = append(cleanWords, f)
 		}
 	}
-
 	if len(cleanWords) == 0 {
 		return false, ""
 	}
 
-	// Long queries are not farewells
-	if len(cleanWords) > 5 {
+	// Check if sentence starts with question word - if so, it's a question, never a farewell
+	firstWord := cleanWords[0]
+	if len(cleanWords) > 1 && (firstWord == "а" || firstWord == "и" || firstWord == "ну") {
+		firstWord = cleanWords[1]
+	}
+	questionStarters := map[string]bool{
+		"кто": true, "что": true, "где": true, "когда": true, "куда": true,
+		"откуда": true, "почему": true, "зачем": true, "сколько": true, "как": true,
+		"какой": true, "какая": true, "какое": true, "какие": true, "чей": true,
+	}
+	if questionStarters[firstWord] {
 		return false, ""
 	}
 
-	// 2. Multi-word exact farewell phrases
+	// 2. Strict single-word termination commands
+	if len(cleanWords) == 1 {
+		singleFarewells := map[string]bool{
+			"пока":      true,
+			"стоп":      true,
+			"хватит":    true,
+			"отбой":     true,
+			"отключись": true,
+			"выключись": true,
+			"прекрати":  true,
+		}
+		if singleFarewells[cleanWords[0]] {
+			return true, "До связи!"
+		}
+	}
+
 	fullClean := strings.Join(cleanWords, " ")
+
+	// 3. Multi-word exact farewell phrases
 	multiFarewells := []string{
 		"до свидания", "до встречи", "до связи", "пока пока", "ну пока",
-		"ладно пока", "давай пока", "все пока", "всё пока", "все хватит",
-		"всё хватит", "стоп игра", "все стоп", "всё стоп", "спокойной ночи",
+		"ладно пока", "давай пока", "все пока", "всё пока", "ну все пока", "ну всё пока",
+		"все хватит", "всё хватит", "стоп игра", "все стоп", "всё стоп",
+		"спокойной ночи", "хорошо пока", "пока друг", "пока колонка",
 	}
 	for _, mf := range multiFarewells {
 		if fullClean == mf {
@@ -390,56 +416,36 @@ func parseHangupCommand(text string) (bool, string) {
 		}
 	}
 
-	// Check if any isolated word is "пока"
-	hasPoka := false
+	// 4. Structural rule for "пока":
+	// In Russian, "пока" is a farewell ONLY if:
+	// a) It is the last word in a short farewell expression (<= 3 words):
+	//    e.g. "ладно давай пока", "ну всё пока", "хорошо давай пока"
+	// b) It is followed ONLY by another "пока" or an assistant name/address:
+	//    e.g. "пока чатгпт", "пока gpt", "пока колонка", "пока пока"
+	// If "пока" has any other words after it (verbs, adverbs, objects, pronouns),
+	// it is an adverb/conjunction ("while / meanwhile / for now / so far") and NOT a farewell!
 	pokaIdx := -1
 	for idx, w := range cleanWords {
 		if w == "пока" {
-			hasPoka = true
 			pokaIdx = idx
 			break
 		}
 	}
 
-	if hasPoka {
-		// "пока что", "пока не", "пока нет", "пока ты", "пока я", "пока ещё" -> NOT hangup!
-		if pokaIdx+1 < len(cleanWords) {
-			next := cleanWords[pokaIdx+1]
-			if next == "что" || next == "не" || next == "нет" || next == "ты" || next == "я" || next == "мы" ||
-				next == "еще" || next == "ещё" || next == "он" || next == "она" || next == "они" {
-				return false, ""
+	if pokaIdx >= 0 && len(cleanWords) <= 3 {
+		// If "пока" is the last word in the phrase
+		if pokaIdx == len(cleanWords)-1 {
+			// e.g. "давай пока", "ну пока", "ладно пока", "всё пока", "ну всё пока"
+			leadWord := cleanWords[0]
+			if leadWord == "давай" || leadWord == "ну" || leadWord == "ладно" ||
+				leadWord == "все" || leadWord == "всё" || leadWord == "хорошо" {
+				return true, "До связи!"
 			}
-		}
-		// If phrase is short and contains isolated word "пока"
-		if len(cleanWords) <= 4 {
-			return true, "До связи!"
-		}
-	}
-
-	// 3. Strict single-word exact commands: "стоп", "хватит", "отбой", "отключись", "выключись"
-	exactFarewells := map[string]bool{
-		"отбой":     true,
-		"стоп":      true,
-		"хватит":    true,
-		"отключись": true,
-		"выключись": true,
-		"прекрати":  true,
-	}
-	if len(cleanWords) <= 3 {
-		for _, w := range cleanWords {
-			if exactFarewells[w] {
-				// avoid "хватит ли"
-				if w == "хватит" && len(cleanWords) > 1 {
-					hasLi := false
-					for _, cw := range cleanWords {
-						if cw == "ли" {
-							hasLi = true
-						}
-					}
-					if hasLi {
-						return false, ""
-					}
-				}
+		} else if pokaIdx == 0 && len(cleanWords) == 2 {
+			// "пока" is the first word and followed by one word:
+			nextWord := cleanWords[1]
+			if nextWord == "пока" || nextWord == "чатгпт" || nextWord == "gpt" ||
+				nextWord == "колонка" || nextWord == "друг" || nextWord == "алиса" {
 				return true, "До связи!"
 			}
 		}
@@ -498,7 +504,7 @@ func detectSearchQuery(text string) (bool, string) {
 
 	fullClean := strings.Join(fields, " ")
 
-	// 0. Filter out small talk and greetings
+	// Filter out small talk and greetings
 	smallTalkPhrases := []string{
 		"привет", "приветствую", "здравствуй", "здравствуйте", "доброе утро",
 		"добрый день", "добрый вечер", "доброй ночи", "как дела", "как твои дела",
@@ -512,67 +518,54 @@ func detectSearchQuery(text string) (bool, string) {
 		}
 	}
 
-	// 1. Internet capability / verification
-	if strings.Contains(lower, "интернет") || strings.Contains(lower, "duckduckgo") ||
-		strings.Contains(lower, "википеди") || strings.Contains(lower, "гугл") ||
-		strings.Contains(lower, "яндекс") || strings.Contains(lower, "погугли") ||
-		strings.Contains(lower, "загугли") || strings.Contains(lower, "связь") ||
-		strings.Contains(lower, "доступ в сеть") || strings.Contains(lower, "онлайн") {
-		return true, trimmed
+	// 1. Explicit search commands: user explicitly asks to look up on internet / web / wiki / google / yandex
+	explicitSearchMarkers := []string{
+		"в интернете", "в сети", "в википедии", "в гугле", "в яндексе", "в duckduckgo",
+		"погугли", "загугли",
+		"найди в инете", "поищи в инете", "посмотри в инете",
 	}
-
-	// 2. Real-time data keywords (Currency, Crypto, Weather, Time, News)
-	dataKeywords := []string{
-		"курс", "доллар", "евро", "юан", "валют", "рубл",
-		"биткоин", "bitcoin", "btc", "крипт", "эфириум", "eth",
-		"погод", "температур", "прогноз", "градус", "дождь", "снег", "ветер",
-		"новост", "событи", "сводка", "дайджест",
-		"число", "день недели", "который час", "сколько времени", "какая дата",
-	}
-	for _, kw := range dataKeywords {
-		if strings.Contains(lower, kw) {
+	for _, marker := range explicitSearchMarkers {
+		if strings.Contains(lower, marker) {
 			return true, trimmed
 		}
 	}
 
-	// 3. Information verbs
-	infoVerbs := []string{
-		"расскажи", "объясни", "назови", "найди", "поищи", "посмотри",
-		"узнай", "проверь", "покажи", "перечисли", "опиши", "подскажи",
-	}
-	for _, v := range infoVerbs {
-		for _, w := range fields {
-			if w == v {
-				return true, trimmed
-			}
-		}
-	}
-
-	// 4. Question words at beginning of sentence
-	firstWord := fields[0]
-	if len(fields) > 1 && (firstWord == "а" || firstWord == "и" || firstWord == "ну" || firstWord == "скажи") {
-		firstWord = fields[1]
-	}
-
-	questionWords := map[string]bool{
-		"кто": true, "что": true, "где": true, "когда": true, "куда": true,
-		"откуда": true, "почему": true, "зачем": true, "сколько": true,
-		"какой": true, "какая": true, "какое": true, "какие": true,
-		"каком": true, "каких": true, "чей": true, "чья": true, "чьё": true,
-		"чьи": true, "чем": true, "кем": true, "кому": true, "чему": true,
-	}
-
-	if questionWords[firstWord] {
+	// 2. Direct internet connectivity inquiries
+	if (strings.Contains(lower, "доступ") && strings.Contains(lower, "интернет")) ||
+		strings.Contains(lower, "у тебя есть интернет") || strings.Contains(lower, "ты в интернете") ||
+		strings.Contains(lower, "ты подключен к интернету") || strings.Contains(lower, "ты подключена к интернету") ||
+		strings.Contains(lower, "проверь интернет") || strings.Contains(lower, "проверь связь") ||
+		strings.Contains(lower, "есть интернет") || strings.Contains(lower, "есть доступ в сеть") ||
+		strings.Contains(lower, "работает ли интернет") || strings.Contains(lower, "интернет работает") {
 		return true, trimmed
 	}
 
-	// "как" (ensure not "как дела", "как ты", "как настроение", "как поживаешь")
-	if firstWord == "как" && len(fields) > 1 && fields[1] != "дела" && fields[1] != "ты" && fields[1] != "настроение" && fields[1] != "поживаешь" {
+	// 3. Real-time dynamic topics (rates, crypto, live weather, current date/time)
+	// Currency / Forex:
+	if strings.Contains(lower, "курс") ||
+		((strings.Contains(lower, "доллар") || strings.Contains(lower, "евро") || strings.Contains(lower, "юан") || strings.Contains(lower, "рубл")) &&
+			(strings.Contains(lower, "почем") || strings.Contains(lower, "сколько стоит") || strings.Contains(lower, "цена") || strings.Contains(lower, "стоимость"))) {
 		return true, trimmed
 	}
 
-	// Question mark at the end with 3 or more words
-	if strings.HasSuffix(trimmed, "?") && len(fields) >= 3 {
+	// Crypto:
+	if strings.Contains(lower, "биткоин") || strings.Contains(lower, "bitcoin") || strings.Contains(lower, "btc") ||
+		strings.Contains(lower, "криптовалют") || strings.Contains(lower, "крипт") || strings.Contains(lower, "эфириум") || strings.Contains(lower, "eth") {
+		return true, trimmed
+	}
+
+	// Weather:
+	if strings.Contains(lower, "погод") || strings.Contains(lower, "прогноз") ||
+		strings.Contains(lower, "будет ли дождь") || strings.Contains(lower, "будет ли снег") ||
+		strings.Contains(lower, "температура на улице") || strings.Contains(lower, "градусов на улице") ||
+		strings.Contains(lower, "какая температура") {
+		return true, trimmed
+	}
+
+	// Current date / time:
+	if strings.Contains(lower, "который час") || strings.Contains(lower, "сколько времени") ||
+		strings.Contains(lower, "сколько сейчас времени") || strings.Contains(lower, "какое сегодня число") ||
+		strings.Contains(lower, "какой сегодня день") || strings.Contains(lower, "какая сегодня дата") {
 		return true, trimmed
 	}
 
