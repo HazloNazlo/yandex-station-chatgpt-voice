@@ -1,14 +1,17 @@
 package voice
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"html"
 	"io"
+	"math"
 	"net"
 	"net/http"
 	"net/url"
@@ -18,20 +21,44 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode"
+
+	"github.com/hajimehoshi/go-mp3"
 )
 
-var sharedHTTPClient = &http.Client{
-	Timeout: 4 * time.Second,
-	Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		DialContext: (&net.Dialer{
-			Timeout:   3 * time.Second,
-			KeepAlive: 30 * time.Second,
-		}).DialContext,
-	},
+func newSecureHTTPClient() *http.Client {
+	rootCAs, _ := x509.SystemCertPool()
+	if rootCAs == nil {
+		rootCAs = x509.NewCertPool()
+	}
+	for _, certPath := range []string{
+		"/etc/ssl/certs/ca-certificates.crt",
+		"/system/vendor/quasar/certs/ca-certificates.crt",
+		"/etc/ssl/cert.pem",
+		"/etc/pki/tls/certs/ca-bundle.crt",
+	} {
+		if data, err := os.ReadFile(certPath); err == nil {
+			rootCAs.AppendCertsFromPEM(data)
+		}
+	}
+
+	return &http.Client{
+		Timeout: 5 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{
+				RootCAs: rootCAs,
+			},
+			DialContext: (&net.Dialer{
+				Timeout:   3 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+		},
+	}
 }
+
+var sharedHTTPClient = newSecureHTTPClient()
 
 var (
 	cbrMu       sync.Mutex
@@ -335,38 +362,52 @@ func handleSetVoice(argsJSON string) (string, error) {
 
 func parseHangupCommand(text string) (bool, string) {
 	lower := strings.ToLower(strings.TrimSpace(text))
-	lower = strings.Trim(lower, ".!?,;:\")'\"")
 
 	// If empty or an explicit question, it's not a farewell
 	if lower == "" || strings.HasSuffix(text, "?") {
 		return false, ""
 	}
 
+	// Normalize punctuation, ellipses, stutters:
+	// e.g. "Завер... Заверши сеанс" -> "завер заверши сеанс"
+	cleaned := strings.Map(func(r rune) rune {
+		if unicode.IsPunct(r) || unicode.IsSymbol(r) {
+			return ' '
+		}
+		return r
+	}, lower)
+	normalized := strings.Join(strings.Fields(cleaned), " ")
+	if normalized == "" {
+		return false, ""
+	}
+
 	// 1. Explicit hangup / termination commands (exact phrases or prefixes)
 	explicitPhrases := []string{
-		"заверши сесси", "завершить сесси", "завершай сесси",
-		"заверши разговор", "завершить разговор", "завершай разговор",
-		"заверши звонок", "завершить звонок", "закончи разговор", "закончить разговор",
-		"закрой разговор", "закрой сесси", "отключи сесси", "останови сесси",
-		"останови разговор", "положи трубку", "конец связи", "прекрати разговор",
+		"заверши сеанс", "завершить сеанс", "завершай сеанс", "завершаем сеанс", "завершаю сеанс",
+		"заверши сесси", "завершить сесси", "завершай сесси", "завершаем сесси", "завершаю сесси",
+		"заверши разговор", "завершить разговор", "завершай разговор", "завершаем разговор", "завершаю разговор",
+		"заверши диалог", "завершить диалог", "завершай диалог", "завершаем диалог", "завершаю диалог",
+		"заверши звонок", "завершить звонок", "сбрось звонок", "сбрось вызов",
+		"закончи сеанс", "закончить сеанс", "заканчивай сеанс", "заканчиваем сеанс",
+		"закончи сесси", "закончить сесси", "заканчивай сесси", "заканчиваем сесси",
+		"закончи разговор", "закончить разговор", "заканчивай разговор", "заканчиваем разговор",
+		"закончи диалог", "закончить диалог", "заканчивай диалог", "заканчиваем диалог",
+		"закрой сеанс", "закрой сесси", "закрой разговор", "закрой диалог",
+		"отключи сеанс", "отключи сесси", "отключи разговор", "отключи диалог",
+		"останови сеанс", "останови сесси", "останови разговор", "останови диалог",
+		"положи трубку", "конец связи", "прекрати разговор",
+		"давай прощаться", "пора прощаться", "давай закончим", "давай заканчивать",
+		"давай завершим", "давай завершать", "давай отключайся", "давай выключайся",
 		"замолчи", "заткнись",
 	}
 	for _, phrase := range explicitPhrases {
-		if strings.Contains(lower, phrase) {
+		if strings.Contains(normalized, phrase) {
 			return true, "До связи!"
 		}
 	}
 
 	// Tokenize words
-	fields := strings.FieldsFunc(lower, func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-	})
-	var cleanWords []string
-	for _, f := range fields {
-		if f != "" {
-			cleanWords = append(cleanWords, f)
-		}
-	}
+	cleanWords := strings.Fields(normalized)
 	if len(cleanWords) == 0 {
 		return false, ""
 	}
@@ -388,20 +429,23 @@ func parseHangupCommand(text string) (bool, string) {
 	// 2. Strict single-word termination commands
 	if len(cleanWords) == 1 {
 		singleFarewells := map[string]bool{
-			"пока":      true,
-			"стоп":      true,
-			"хватит":    true,
-			"отбой":     true,
-			"отключись": true,
-			"выключись": true,
-			"прекрати":  true,
+			"пока":       true,
+			"стоп":       true,
+			"хватит":     true,
+			"отбой":      true,
+			"отключись":  true,
+			"выключись":  true,
+			"отключайся": true,
+			"выключайся": true,
+			"закройся":   true,
+			"заканчивай": true,
+			"завершай":   true,
+			"прекрати":   true,
 		}
 		if singleFarewells[cleanWords[0]] {
 			return true, "До связи!"
 		}
 	}
-
-	fullClean := strings.Join(cleanWords, " ")
 
 	// 3. Multi-word exact farewell phrases
 	multiFarewells := []string{
@@ -409,9 +453,10 @@ func parseHangupCommand(text string) (bool, string) {
 		"ладно пока", "давай пока", "все пока", "всё пока", "ну все пока", "ну всё пока",
 		"все хватит", "всё хватит", "стоп игра", "все стоп", "всё стоп",
 		"спокойной ночи", "хорошо пока", "пока друг", "пока колонка",
+		"всего хорошего", "всего доброго", "пока алиса", "пока gpt", "пока чатгпт",
 	}
 	for _, mf := range multiFarewells {
-		if fullClean == mf {
+		if normalized == mf {
 			return true, "До связи!"
 		}
 	}
@@ -569,6 +614,29 @@ func detectSearchQuery(text string) (bool, string) {
 		return true, trimmed
 	}
 
+	// 4. News / current events
+	if strings.Contains(lower, "новост") || strings.Contains(lower, "что нового") || strings.Contains(lower, "что произошло") {
+		return true, trimmed
+	}
+
+	// 5. Direct informational queries (encyclopedic, biographical, scientific)
+	factPrefixes := []string{
+		"кто такой", "кто такая", "кто такие", "кто президент", "кто написал", "кто автор",
+		"что такое", "что значит", "где находится", "где расположен", "где расположена",
+		"когда родился", "когда родилась", "когда умер", "когда произошл",
+		"расскажи историю", "объясни как работает",
+	}
+	for _, fp := range factPrefixes {
+		if strings.Contains(lower, fp) {
+			return true, trimmed
+		}
+	}
+
+	// 6. URL / web page opening
+	if isURL, _ := detectURLQuery(trimmed); isURL {
+		return true, trimmed
+	}
+
 	return false, ""
 }
 
@@ -618,6 +686,30 @@ func handleSetVolume(argsJSON string) (string, error) {
 	return fmt.Sprintf(`{"status":"ok","volume":%d,"message":"Громкость изменена на %d%%"}`, newVol, newVol), nil
 }
 
+func rubleStr(n int) string {
+	r10 := n % 10
+	r100 := n % 100
+	if r10 == 1 && r100 != 11 {
+		return fmt.Sprintf("%d рубль", n)
+	}
+	if r10 >= 2 && r10 <= 4 && (r100 < 10 || r100 >= 20) {
+		return fmt.Sprintf("%d рубля", n)
+	}
+	return fmt.Sprintf("%d рублей", n)
+}
+
+func kopeckStr(n int) string {
+	r10 := n % 10
+	r100 := n % 100
+	if r10 == 1 && r100 != 11 {
+		return fmt.Sprintf("%d копейка", n)
+	}
+	if r10 >= 2 && r10 <= 4 && (r100 < 10 || r100 >= 20) {
+		return fmt.Sprintf("%d копейки", n)
+	}
+	return fmt.Sprintf("%d копеек", n)
+}
+
 func fetchCBRRates(ctx context.Context) (string, error) {
 	cbrMu.Lock()
 	if cbrCached != "" && time.Since(cbrCachedAt) < 30*time.Minute {
@@ -652,18 +744,16 @@ func fetchCBRRates(ctx context.Context) (string, error) {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("Официальные курсы валют ЦБ РФ: ")
+	sb.WriteString("Официальный курс: ")
 	if usd, ok := data.Valute["USD"]; ok {
-		diff := usd.Value - usd.Previous
-		sb.WriteString(fmt.Sprintf("Доллар: %.2f ₽ (%+.2f), ", usd.Value, diff))
+		rub := int(usd.Value)
+		kop := int(math.Round((usd.Value - float64(rub)) * 100))
+		sb.WriteString(fmt.Sprintf("доллар %s %s, ", rubleStr(rub), kopeckStr(kop)))
 	}
 	if eur, ok := data.Valute["EUR"]; ok {
-		diff := eur.Value - eur.Previous
-		sb.WriteString(fmt.Sprintf("Евро: %.2f ₽ (%+.2f), ", eur.Value, diff))
-	}
-	if cny, ok := data.Valute["CNY"]; ok {
-		diff := cny.Value - cny.Previous
-		sb.WriteString(fmt.Sprintf("Юань: %.2f ₽ (%+.2f).", cny.Value, diff))
+		rub := int(eur.Value)
+		kop := int(math.Round((eur.Value - float64(rub)) * 100))
+		sb.WriteString(fmt.Sprintf("евро %s %s.", rubleStr(rub), kopeckStr(kop)))
 	}
 	result := sb.String()
 
@@ -695,26 +785,408 @@ func fetchCryptoPrice(ctx context.Context, symbol string) (string, error) {
 		return "", err
 	}
 	if p, err := strconv.ParseFloat(data.Price, 64); err == nil {
-		return fmt.Sprintf("Курс %s: $%.2f USD (на бирже Binance).", symbol, p), nil
+		return fmt.Sprintf("Курс биткоина составляет %d долларов.", int(math.Round(p))), nil
 	}
-	return fmt.Sprintf("Курс %s: %s USD.", symbol, data.Price), nil
+	return fmt.Sprintf("Курс биткоина %s долларов.", data.Price), nil
+}
+
+func formatWeatherSpeech(city, raw string) string {
+	if raw == "" || strings.Contains(raw, "location not found") || strings.Contains(raw, "upstream error") ||
+		strings.Contains(raw, "Unknown location") || strings.Contains(raw, "<html>") {
+		return ""
+	}
+
+	cityName := "вашем городе"
+	if city != "" {
+		cityName = "городе " + strings.Title(city)
+	}
+
+	cond := ""
+	if strings.Contains(raw, "☀️") {
+		cond = "ясно, "
+	} else if strings.Contains(raw, "🌤") || strings.Contains(raw, "⛅") || strings.Contains(raw, "🌥") {
+		cond = "переменная облачность, "
+	} else if strings.Contains(raw, "☁") {
+		cond = "пасмурно, "
+	} else if strings.Contains(raw, "🌧") || strings.Contains(raw, "🌦") {
+		cond = "небольшой дождь, "
+	} else if strings.Contains(raw, "❄") || strings.Contains(raw, "🌨") {
+		cond = "снег, "
+	} else if strings.Contains(raw, "⛈") {
+		cond = "гроза, "
+	} else if strings.Contains(raw, "🌫") {
+		cond = "туман, "
+	}
+
+	tempRe := regexp.MustCompile(`([+-]?\d+)\s*°C`)
+	tempStr := ""
+	if m := tempRe.FindStringSubmatch(raw); len(m) > 1 {
+		val, err := strconv.Atoi(m[1])
+		if err == nil {
+			if val > 0 {
+				tempStr = fmt.Sprintf("плюс %d", val)
+			} else if val < 0 {
+				tempStr = fmt.Sprintf("минус %d", -val)
+			} else {
+				tempStr = "ноль"
+			}
+			absVal := val
+			if absVal < 0 {
+				absVal = -absVal
+			}
+			rem10 := absVal % 10
+			rem100 := absVal % 100
+			if rem10 == 1 && rem100 != 11 {
+				tempStr += " градус"
+			} else if rem10 >= 2 && rem10 <= 4 && (rem100 < 10 || rem100 >= 20) {
+				tempStr += " градуса"
+			} else {
+				tempStr += " градусов"
+			}
+		}
+	}
+
+	windRe := regexp.MustCompile(`(\d+)\s*m/s`)
+	windStr := ""
+	if m := windRe.FindStringSubmatch(raw); len(m) > 1 {
+		windVal, _ := strconv.Atoi(m[1])
+		rem10 := windVal % 10
+		rem100 := windVal % 100
+		suffix := "метров"
+		if rem10 == 1 && rem100 != 11 {
+			suffix = "метр"
+		} else if rem10 >= 2 && rem10 <= 4 && (rem100 < 10 || rem100 >= 20) {
+			suffix = "метра"
+		}
+		windStr = fmt.Sprintf(", ветер %d %s в секунду", windVal, suffix)
+	}
+
+	if tempStr != "" {
+		return fmt.Sprintf("Сейчас в %s %s%s%s.", cityName, cond, tempStr, windStr)
+	}
+	return ""
+}
+
+func wmoCodeToString(code int) string {
+	switch code {
+	case 0:
+		return "ясно"
+	case 1:
+		return "в основном ясно"
+	case 2:
+		return "переменная облачность"
+	case 3:
+		return "пасмурно"
+	case 45, 48:
+		return "туман"
+	case 51, 53, 55:
+		return "моросящий дождь"
+	case 56, 57:
+		return "ледяная морось"
+	case 61:
+		return "небольшой дождь"
+	case 63:
+		return "умеренный дождь"
+	case 65:
+		return "сильный дождь"
+	case 66, 67:
+		return "ледяной дождь"
+	case 71:
+		return "небольшой снег"
+	case 73:
+		return "снегопад"
+	case 75:
+		return "сильный снегопад"
+	case 77:
+		return "снежные зерна"
+	case 80, 81, 82:
+		return "ливень"
+	case 85, 86:
+		return "снежный заряд"
+	case 95:
+		return "гроза"
+	case 96, 99:
+		return "гроза с градом"
+	default:
+		return "облачно"
+	}
+}
+
+func formatTempSpeech(temp float64) string {
+	t := int(math.Round(temp))
+	if t > 0 {
+		return fmt.Sprintf("плюс %d %s", t, degreeStr(t))
+	} else if t < 0 {
+		return fmt.Sprintf("минус %d %s", -t, degreeStr(-t))
+	}
+	return "ноль градусов"
+}
+
+func degreeStr(n int) string {
+	n = n % 100
+	if n >= 11 && n <= 19 {
+		return "градусов"
+	}
+	switch n % 10 {
+	case 1:
+		return "градус"
+	case 2, 3, 4:
+		return "градуса"
+	default:
+		return "градусов"
+	}
+}
+
+func meterStr(n int) string {
+	n = n % 100
+	if n >= 11 && n <= 19 {
+		return "метров"
+	}
+	switch n % 10 {
+	case 1:
+		return "метр"
+	case 2, 3, 4:
+		return "метра"
+	default:
+		return "метров"
+	}
+}
+
+func fetchOpenMeteoWeather(ctx context.Context, city string, query string) (string, error) {
+	geoCity := city
+	if geoCity == "" {
+		geoCity = "Москва"
+	}
+
+	geoURL := "https://geocoding-api.open-meteo.com/v1/search?name=" + url.QueryEscape(geoCity) + "&count=1&language=ru&format=json"
+	geoReq, err := http.NewRequestWithContext(ctx, http.MethodGet, geoURL, nil)
+	if err != nil {
+		return "", err
+	}
+	geoResp, err := sharedHTTPClient.Do(geoReq)
+	if err != nil {
+		return "", err
+	}
+	defer geoResp.Body.Close()
+
+	var geoData struct {
+		Results []struct {
+			Name      string  `json:"name"`
+			Latitude  float64 `json:"latitude"`
+			Longitude float64 `json:"longitude"`
+			Country   string  `json:"country"`
+		} `json:"results"`
+	}
+	if err := json.UnmarshalRead(io.LimitReader(geoResp.Body, 64*1024), &geoData); err != nil || len(geoData.Results) == 0 {
+		return "", errors.New("geocoding failed")
+	}
+
+	target := geoData.Results[0]
+	cityName := target.Name
+
+	weatherURL := fmt.Sprintf("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min&wind_speed_unit=ms&timezone=auto", target.Latitude, target.Longitude)
+	wReq, err := http.NewRequestWithContext(ctx, http.MethodGet, weatherURL, nil)
+	if err != nil {
+		return "", err
+	}
+	wResp, err := sharedHTTPClient.Do(wReq)
+	if err != nil {
+		return "", err
+	}
+	defer wResp.Body.Close()
+
+	var wData struct {
+		Current struct {
+			Temperature float64 `json:"temperature_2m"`
+			Apparent    float64 `json:"apparent_temperature"`
+			Humidity    int     `json:"relative_humidity_2m"`
+			Precip      float64 `json:"precipitation"`
+			WeatherCode int     `json:"weather_code"`
+			WindSpeed   float64 `json:"wind_speed_10m"`
+		} `json:"current"`
+		Daily struct {
+			Time        []string  `json:"time"`
+			WeatherCode []int     `json:"weather_code"`
+			TempMax     []float64 `json:"temperature_2m_max"`
+			TempMin     []float64 `json:"temperature_2m_min"`
+		} `json:"daily"`
+	}
+	if err := json.UnmarshalRead(io.LimitReader(wResp.Body, 128*1024), &wData); err != nil {
+		return "", err
+	}
+
+	isTomorrow := strings.Contains(strings.ToLower(query), "завтра") || strings.Contains(strings.ToLower(query), "следующ")
+	if isTomorrow && len(wData.Daily.WeatherCode) > 1 {
+		desc := wmoCodeToString(wData.Daily.WeatherCode[1])
+		tMax := formatTempSpeech(wData.Daily.TempMax[1])
+		tMin := formatTempSpeech(wData.Daily.TempMin[1])
+		return fmt.Sprintf("Завтра в городе %s ожидается %s, днем до %s, ночью %s.", cityName, desc, tMax, tMin), nil
+	}
+
+	desc := wmoCodeToString(wData.Current.WeatherCode)
+	temp := formatTempSpeech(wData.Current.Temperature)
+	wind := int(math.Round(wData.Current.WindSpeed))
+	return fmt.Sprintf("Сейчас в городе %s %s, %s, ветер %d %s в секунду.", cityName, desc, temp, wind, meterStr(wind)), nil
+}
+
+var russianCityNominative = map[string]string{
+	"москве": "Москва", "москва": "Москва",
+	"калуге": "Калуга", "калуга": "Калуга",
+	"питере": "Санкт-Петербург", "петербурге": "Санкт-Петербург", "санкт-петербурге": "Санкт-Петербург", "спб": "Санкт-Петербург", "санкт петербурге": "Санкт-Петербург",
+	"самаре": "Самара", "самара": "Самара",
+	"казани": "Казань", "казань": "Казань",
+	"уфе": "Уфа", "уфа": "Уфа",
+	"туле": "Тула", "тула": "Тула",
+	"твери": "Тверь", "тверь": "Тверь",
+	"перми": "Пермь", "пермь": "Пермь",
+	"сочи": "Сочи",
+	"краснодаре": "Краснодар", "краснодар": "Краснодар",
+	"ростове": "Ростов-на-Дону", "ростов": "Ростов-на-Дону", "ростове на дону": "Ростов-на-Дону",
+	"воронеже": "Воронеж", "воронеж": "Воронеж",
+	"екатеринбурге": "Екатеринбург", "екатеринбург": "Екатеринбург",
+	"новосибирске": "Новосибирск", "новосибирск": "Новосибирск",
+	"челябинске": "Челябинск", "челябинск": "Челябинск",
+	"омске": "Омск", "омск": "Омск",
+	"красноярске": "Красноярск", "красноярск": "Красноярск",
+	"волгограде": "Волгоград", "волгоград": "Волгоград",
+	"саратове": "Саратов", "саратов": "Саратов",
+	"тюмени": "Тюмень", "тюмень": "Тюмень",
+	"тольятти": "Тольятти",
+	"ижевске": "Ижевск", "ижевск": "Ижевск",
+	"барнауле": "Барнаул", "барнаул": "Барнаул",
+	"иркутске": "Иркутск", "иркутск": "Иркутск",
+	"ульяновске": "Ульяновск", "ульяновск": "Ульяновск",
+	"хабаровске": "Хабаровск", "хабаровск": "Хабаровск",
+	"владивостоке": "Владивосток", "владивосток": "Владивосток",
+	"ярославле": "Ярославль", "ярославль": "Ярославль",
+	"томске": "Томск", "томск": "Томск",
+	"оренбурге": "Оренбург", "оренбург": "Оренбург",
+	"рязани": "Рязань", "рязань": "Рязань",
+	"астрахани": "Астрахань", "астрахань": "Астрахань",
+	"пензе": "Пенза", "пенза": "Пенза",
+	"липецке": "Липецк", "липецк": "Липецк",
+	"кирове": "Киров", "киров": "Киров",
+	"чебоксарах": "Чебоксары", "чебоксары": "Чебоксары",
+	"калининграде": "Калининград", "калининград": "Калининград",
+	"курске": "Курск", "курск": "Курск",
+	"брянске": "Брянск", "брянск": "Брянск",
+	"орле": "Орёл", "орел": "Орёл",
+	"белгороде": "Белгород", "белгород": "Белгород",
+	"владимире": "Владимир", "владимир": "Владимир",
+	"смоленске": "Смоленск", "смоленск": "Смоленск",
+	"иванове": "Иваново", "иваново": "Иваново",
+	"нижнем новгороде": "Нижний Новгород",
+	"великом новгороде": "Великий Новгород",
+}
+
+func isWeatherStopword(w string) bool {
+	stopwords := map[string]bool{
+		"сейчас": true, "сегодня": true, "завтра": true, "послезавтра": true,
+		"утром": true, "вечером": true, "днем": true, "ночью": true,
+		"на": true, "в": true, "во": true, "для": true, "пожалуйста": true,
+		"мне": true, "нам": true, "подскажи": true, "скажи": true, "будет": true,
+		"ожидается": true, "какая": true, "какой": true, "погода": true, "погоду": true,
+		"температура": true, "температуру": true, "градусов": true, "градус": true,
+		"неделе": true, "выходных": true, "там": true, "тут": true, "здесь": true,
+	}
+	return stopwords[w]
+}
+
+func extractCityFromWeather(query string) string {
+	lower := strings.ToLower(query)
+	cleaned := strings.Map(func(r rune) rune {
+		if unicode.IsPunct(r) || unicode.IsSymbol(r) {
+			return ' '
+		}
+		return r
+	}, lower)
+	words := strings.Fields(cleaned)
+
+	cityWords := []string{}
+	foundPrep := false
+	for _, w := range words {
+		if !foundPrep {
+			if w == "в" || w == "во" || w == "для" || w == "городе" || w == "город" {
+				foundPrep = true
+			}
+			continue
+		}
+		if isWeatherStopword(w) {
+			if len(cityWords) > 0 {
+				break
+			}
+			continue
+		}
+		cityWords = append(cityWords, w)
+		if len(cityWords) == 2 {
+			break
+		}
+	}
+
+	if len(cityWords) == 0 {
+		return ""
+	}
+	return strings.Join(cityWords, " ")
+}
+
+func normalizeCity(raw string) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return "Москва"
+	}
+	if nom, ok := russianCityNominative[raw]; ok {
+		return nom
+	}
+	if strings.Contains(raw, "петербург") || strings.Contains(raw, "питер") {
+		return "Санкт-Петербург"
+	}
+	if strings.Contains(raw, "новгород") {
+		if strings.Contains(raw, "нижн") {
+			return "Нижний Новгород"
+		}
+		if strings.Contains(raw, "велик") {
+			return "Великий Новгород"
+		}
+	}
+	if strings.Contains(raw, "ростов") {
+		return "Ростов-на-Дону"
+	}
+	runes := []rune(raw)
+	if len(runes) > 3 && runes[len(runes)-1] == 'е' {
+		candidate := string(runes[:len(runes)-1]) + "а"
+		if nom, ok := russianCityNominative[candidate]; ok {
+			return nom
+		}
+		return strings.Title(candidate)
+	}
+	return strings.Title(raw)
 }
 
 func fetchWeather(ctx context.Context, query string) (string, error) {
-	city := ""
-	lower := strings.ToLower(query)
-	reCity := regexp.MustCompile(`(?:в|во|для|город[ае]?)\s+([а-яёa-z-]+)`)
-	if m := reCity.FindStringSubmatch(lower); len(m) > 1 {
-		city = m[1]
-	}
+	rawCity := extractCityFromWeather(query)
+	city := normalizeCity(rawCity)
 
 	weatherMu.Lock()
-	if cached, ok := weatherCached[city]; ok && time.Since(weatherCachedAt[city]) < 15*time.Minute {
+	cacheKey := city + "_" + query
+	if cached, ok := weatherCached[cacheKey]; ok && time.Since(weatherCachedAt[cacheKey]) < 15*time.Minute {
 		weatherMu.Unlock()
 		return cached, nil
 	}
 	weatherMu.Unlock()
 
+	// 1. Primary provider: Open-Meteo with geocoding (fast 1.5s timeout)
+	omCtx, omCancel := context.WithTimeout(ctx, 1500*time.Millisecond)
+	res, omErr := fetchOpenMeteoWeather(omCtx, city, query)
+	omCancel()
+	if omErr == nil && res != "" {
+		weatherMu.Lock()
+		weatherCached[cacheKey] = res
+		weatherCachedAt[cacheKey] = time.Now()
+		weatherMu.Unlock()
+		return res, nil
+	}
+
+	// 2. Fallback provider: wttr.in
 	reqURL := "https://wttr.in/" + url.PathEscape(city) + "?m&M&format=4&lang=ru"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
@@ -731,15 +1203,22 @@ func fetchWeather(ctx context.Context, query string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	res := strings.TrimSpace(string(body))
-	if res == "" || strings.Contains(res, "Unknown location") {
+	bodyStr := strings.TrimSpace(string(body))
+	if bodyStr == "" || strings.Contains(bodyStr, "Unknown location") || strings.Contains(bodyStr, "location not found") {
 		return "", errors.New("location not found")
 	}
-	result := fmt.Sprintf("Погода сейчас: %s", res)
+	displayCity := city
+	if rawCity == "" {
+		displayCity = ""
+	}
+	result := formatWeatherSpeech(displayCity, bodyStr)
+	if result == "" {
+		return "", errors.New("cannot format weather response")
+	}
 
 	weatherMu.Lock()
-	weatherCached[city] = result
-	weatherCachedAt[city] = time.Now()
+	weatherCached[cacheKey] = result
+	weatherCachedAt[cacheKey] = time.Now()
 	weatherMu.Unlock()
 
 	return result, nil
@@ -844,6 +1323,195 @@ func fetchDuckDuckGo(ctx context.Context, query string) (string, error) {
 	return sb.String(), nil
 }
 
+func isPrivateOrBlockedIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	if ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsUnspecified() {
+		return true
+	}
+	if ip4 := ip.To4(); ip4 != nil {
+		switch {
+		case ip4[0] == 0:
+			return true
+		case ip4[0] == 10:
+			return true
+		case ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127:
+			return true
+		case ip4[0] == 127:
+			return true
+		case ip4[0] == 169 && ip4[1] == 254:
+			return true
+		case ip4[0] == 172 && ip4[1] >= 16 && ip4[1] <= 31:
+			return true
+		case ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 0:
+			return true
+		case ip4[0] == 192 && ip4[1] == 0 && ip4[2] == 2:
+			return true
+		case ip4[0] == 192 && ip4[1] == 168:
+			return true
+		case ip4[0] == 198 && ip4[1] == 51 && ip4[2] == 100:
+			return true
+		case ip4[0] == 203 && ip4[1] == 0 && ip4[2] == 113:
+			return true
+		case ip4[0] >= 224:
+			return true
+		}
+	}
+	return false
+}
+
+func extractPageContent(htmlStr string) (string, string) {
+	reTitle := regexp.MustCompile(`(?is)<title[^>]*>(.*?)</title>`)
+	title := ""
+	if m := reTitle.FindStringSubmatch(htmlStr); len(m) > 1 {
+		title = strings.TrimSpace(html.UnescapeString(cleanHTML(m[1])))
+	}
+
+	clean := regexp.MustCompile(`(?is)<script[^>]*>.*?</script>`).ReplaceAllString(htmlStr, " ")
+	clean = regexp.MustCompile(`(?is)<style[^>]*>.*?</style>`).ReplaceAllString(clean, " ")
+	clean = regexp.MustCompile(`(?is)<noscript[^>]*>.*?</noscript>`).ReplaceAllString(clean, " ")
+	clean = regexp.MustCompile(`(?is)<!--.*?-->`).ReplaceAllString(clean, " ")
+
+	clean = regexp.MustCompile(`<[^>]+>`).ReplaceAllString(clean, " ")
+	clean = html.UnescapeString(clean)
+
+	clean = regexp.MustCompile(`\s+`).ReplaceAllString(clean, " ")
+	clean = strings.TrimSpace(clean)
+
+	runes := []rune(clean)
+	if len(runes) > 350 {
+		clean = string(runes[:350]) + "..."
+	}
+
+	return title, clean
+}
+
+func openURL(ctx context.Context, rawURL string) (string, error) {
+	trimmed := strings.TrimSpace(rawURL)
+	if !strings.HasPrefix(trimmed, "http://") && !strings.HasPrefix(trimmed, "https://") {
+		trimmed = "https://" + trimmed
+	}
+	parsed, err := url.Parse(trimmed)
+	if err != nil {
+		return "", fmt.Errorf("некорректный адрес ссылки: %w", err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return "", errors.New("поддерживаются только ссылки http и https")
+	}
+	hostname := parsed.Hostname()
+	if hostname == "" {
+		return "", errors.New("пустой хост")
+	}
+
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip", hostname)
+	if err != nil {
+		return "", fmt.Errorf("адрес %s не найден: %w", hostname, err)
+	}
+	if len(ips) == 0 {
+		return "", fmt.Errorf("адрес %s не найден", hostname)
+	}
+	for _, ip := range ips {
+		if isPrivateOrBlockedIP(ip) {
+			return "", fmt.Errorf("доступ к приватному или локальному адресу %s заблокирован", ip.String())
+		}
+	}
+
+	safeClient := &http.Client{
+		Timeout: 6 * time.Second,
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   3 * time.Second,
+				KeepAlive: 30 * time.Second,
+				Control: func(network, address string, c syscall.RawConn) error {
+					host, _, err := net.SplitHostPort(address)
+					if err != nil {
+						return err
+					}
+					ip := net.ParseIP(host)
+					if isPrivateOrBlockedIP(ip) {
+						return fmt.Errorf("SSRF blocked: %s is private", host)
+					}
+					return nil
+				},
+			}).DialContext,
+		},
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 5 {
+				return errors.New("слишком много перенаправлений")
+			}
+			if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+				return errors.New("недопустимый протокол перенаправления")
+			}
+			destHost := req.URL.Hostname()
+			destIPs, err := net.LookupIP(destHost)
+			if err != nil {
+				return err
+			}
+			for _, ip := range destIPs {
+				if isPrivateOrBlockedIP(ip) {
+					return fmt.Errorf("перенаправление на приватный адрес заблокировано")
+				}
+			}
+			return nil
+		},
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, parsed.String(), nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; YandexStationBot/1.0)")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,text/plain;q=0.9,*/*;q=0.8")
+
+	resp, err := safeClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("ошибка загрузки страницы: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("страница вернула статус %d", resp.StatusCode)
+	}
+
+	bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return "", fmt.Errorf("ошибка чтения содержимого: %w", err)
+	}
+
+	title, readable := extractPageContent(string(bodyBytes))
+	if title == "" && readable == "" {
+		return fmt.Sprintf("Страница %s открыта, но на ней нет текстового содержимого.", hostname), nil
+	}
+	if title != "" && readable != "" {
+		return fmt.Sprintf("Страница %s. Заголовок: %s. Содержимое: %s", hostname, title, readable), nil
+	}
+	if title != "" {
+		return fmt.Sprintf("Страница %s. Заголовок: %s.", hostname, title), nil
+	}
+	return fmt.Sprintf("Страница %s. Содержимое: %s", hostname, readable), nil
+}
+
+func detectURLQuery(text string) (bool, string) {
+	lower := strings.ToLower(strings.TrimSpace(text))
+
+	reURL := regexp.MustCompile(`https?://[^\s"'<>]+`)
+	if m := reURL.FindString(text); m != "" {
+		return true, m
+	}
+
+	reDomain := regexp.MustCompile(`(?:открой|посмотри|прочитай|перейди на|зайди на|что на)\s+(?:сайт[еа]?\s+)?([a-z0-9-]+(?:\.[a-z0-9-]+)+(?:/[^\s]*)?)`)
+	if m := reDomain.FindStringSubmatch(lower); len(m) > 1 {
+		target := m[1]
+		if !strings.HasPrefix(target, "http://") && !strings.HasPrefix(target, "https://") {
+			target = "https://" + target
+		}
+		return true, target
+	}
+
+	return false, ""
+}
+
 func searchWeb(ctx context.Context, query string) (string, error) {
 	trimmed := strings.TrimSpace(query)
 	if trimmed == "" {
@@ -896,6 +1564,15 @@ func searchWeb(ctx context.Context, query string) (string, error) {
 		strings.Contains(lower, "градус") || strings.Contains(lower, "дождь") || strings.Contains(lower, "снег") {
 		if res, err := fetchWeather(ctx, trimmed); err == nil {
 			return res, nil
+		}
+	}
+
+	// 5. URL opening inquiry
+	if isURL, targetURL := detectURLQuery(trimmed); isURL {
+		if res, err := openURL(ctx, targetURL); err == nil {
+			return res, nil
+		} else {
+			return fmt.Sprintf("Не удалось открыть страницу %s: %v", targetURL, err), nil
 		}
 	}
 
@@ -1125,4 +1802,160 @@ func parseToolCalls(data []byte) []toolCallInfo {
 		}
 	}
 	return calls
+}
+
+func playSpeech(ctx context.Context, text string) error {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return nil
+	}
+	sentences := splitIntoSentences(trimmed, 180)
+	for _, s := range sentences {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := playSpeechChunk(ctx, s); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func splitIntoSentences(text string, maxLen int) []string {
+	trimmed := strings.TrimSpace(text)
+	if len([]rune(trimmed)) <= maxLen {
+		return []string{trimmed}
+	}
+	var res []string
+	parts := strings.SplitAfter(trimmed, ". ")
+	cur := ""
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if len([]rune(cur))+len([]rune(p))+2 <= maxLen {
+			if cur != "" {
+				cur += ". " + p
+			} else {
+				cur = p
+			}
+		} else {
+			if cur != "" {
+				res = append(res, cur)
+			}
+			if len([]rune(p)) > maxLen {
+				subparts := strings.SplitAfter(p, ", ")
+				subCur := ""
+				for _, sp := range subparts {
+					sp = strings.TrimSpace(sp)
+					if sp == "" {
+						continue
+					}
+					if len([]rune(subCur))+len([]rune(sp))+2 <= maxLen {
+						if subCur != "" {
+							subCur += ", " + sp
+						} else {
+							subCur = sp
+						}
+					} else {
+						if subCur != "" {
+							res = append(res, subCur)
+						}
+						subCur = sp
+					}
+				}
+				cur = subCur
+			} else {
+				cur = p
+			}
+		}
+	}
+	if cur != "" {
+		res = append(res, cur)
+	}
+	return res
+}
+
+func playSpeechChunk(ctx context.Context, text string) error {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return nil
+	}
+
+	ttsURLs := []string{
+		"https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=ru&q=" + url.QueryEscape(trimmed),
+		"https://translate.google.com/translate_tts?ie=UTF-8&client=gtx&tl=ru&q=" + url.QueryEscape(trimmed),
+	}
+
+	var resp *http.Response
+	var fetchErr error
+	for _, ttsURL := range ttsURLs {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ttsURL, nil)
+		if err != nil {
+			fetchErr = err
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+		resp, fetchErr = sharedHTTPClient.Do(req)
+		if fetchErr == nil && resp.StatusCode == http.StatusOK {
+			break
+		}
+		if resp != nil {
+			resp.Body.Close()
+			resp = nil
+		}
+	}
+	if resp == nil {
+		return fmt.Errorf("TTS request failed: %w", fetchErr)
+	}
+	defer resp.Body.Close()
+
+	mp3Data, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return err
+	}
+
+	dec, err := mp3.NewDecoder(bytes.NewReader(mp3Data))
+	if err != nil {
+		return err
+	}
+
+	inRate := dec.SampleRate()
+	pcmRaw, err := io.ReadAll(dec)
+	if err != nil {
+		return err
+	}
+
+	ratio := 48000 / inRate
+	if ratio < 1 {
+		ratio = 1
+	}
+
+	var pcm48k bytes.Buffer
+	pcm48k.Grow(len(pcmRaw) * ratio)
+	for i := 0; i+4 <= len(pcmRaw); i += 4 {
+		sample := pcmRaw[i : i+4]
+		for r := 0; r < ratio; r++ {
+			pcm48k.Write(sample)
+		}
+	}
+
+	cmd := exec.CommandContext(
+		ctx,
+		"/usr/bin/aplay",
+		"-q",
+		"-D",
+		"default",
+		"-t",
+		"raw",
+		"-f",
+		"S16_LE",
+		"-r",
+		"48000",
+		"-c",
+		"2",
+	)
+	cmd.Stdin = &pcm48k
+	return cmd.Run()
 }

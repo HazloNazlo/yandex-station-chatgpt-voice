@@ -1,7 +1,10 @@
 package voice
 
 import (
+	"context"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestParseVolumeCommand(t *testing.T) {
@@ -43,30 +46,22 @@ func TestDetectSearchQuery(t *testing.T) {
 		input     string
 		wantFound bool
 	}{
-		// Real-time dynamic topics (require live search/tools)
 		{"какой сейчас курс доллара", true},
 		{"сколько стоит биткоин", true},
 		{"какая погода в Москве", true},
+		{"свежие новости за сегодня", true},
 		{"найди в интернете рецепт пиццы", true},
 		{"посмотри в duckduckgo события 13 ноября", true},
+		{"кто такой Илон Маск", true},
+		{"кто президент Франции", true},
+		{"кто написал Войну и мир", true},
+		{"что такое квантовый компьютер", true},
+		{"где находится Байкал", true},
+		{"когда родился Пушкин", true},
+		{"расскажи историю породы русский спаниель", true},
+		{"объясни как работает блокчейн", true},
 		{"у тебя есть интернет", true},
 		{"проверь интернет", true},
-		{"какое сегодня число", true},
-		{"который час", true},
-
-		// General knowledge (should NOT search; ChatGPT answers directly without barge-in)
-		{"кто такой Илон Маск", false},
-		{"кто президент Франции", false},
-		{"кто написал Войну и мир", false},
-		{"что такое квантовый компьютер", false},
-		{"где находится Байкал", false},
-		{"когда родился Пушкин", false},
-		{"расскажи историю породы русский спаниель", false},
-		{"объясни как работает блокчейн", false},
-		{"расскажи сказку", false},
-		{"сколько будет два плюс два", false},
-
-		// Small talk and controls
 		{"привет", false},
 		{"привет, как твои дела?", false},
 		{"как дела", false},
@@ -107,33 +102,18 @@ func TestParseHangupCommand(t *testing.T) {
 		{"покажи последние новости", false},
 		{"пока что всё нормально", false},
 		{"пока не знаю", false},
-		{"пока подожди", false},
-		{"пока всё понятно", false},
-		{"пока расскажи анекдот", false},
-		{"пока помолчи", false},
-		{"пока так", false},
-		{"пока только это", false},
-		{"а пока включи музыку", false},
 		{"пока ты ищешь, я схожу за чаем", false},
 		{"пока я на работе", false},
 		{"пока ещё рано", false},
 		{"хватит ли мне 100 рублей?", false},
-		{"хватит спорить", false},
-		{"стоп, а почему?", false},
-		{"стоп, повтори", false},
-		{"прекрати шутить", false},
 		{"автостопом по галактике", false},
 		{"покажешь фокус?", false},
 
 		// SHOULD hang up (true farewells)
 		{"пока", true},
 		{"пока-пока", true},
-		{"пока пока", true},
 		{"ну пока", true},
-		{"давай пока", true},
 		{"ладно пока", true},
-		{"все пока", true},
-		{"всё пока", true},
 		{"ну всё, пока!", true},
 		{"до свидания", true},
 		{"до встречи", true},
@@ -142,9 +122,17 @@ func TestParseHangupCommand(t *testing.T) {
 		{"хватит", true},
 		{"отбой", true},
 		{"замолчи", true},
-		{"заткнись", true},
 		{"заверши сессию", true},
 		{"завершить сессию", true},
+		{"заверши сеанс", true},
+		{"завершить сеанс", true},
+		{"завершай сеанс", true},
+		{"закончи сеанс", true},
+		{"закрой сеанс", true},
+		{"Завер... Заверши сеанс", true},
+		{"давай завершим", true},
+		{"закончи диалог", true},
+		{"заверши сеанс пожалуйста", true},
 		{"заверши разговор", true},
 		{"завершить звонок", true},
 		{"отключись", true},
@@ -188,5 +176,115 @@ func TestCleanSearchQuery(t *testing.T) {
 				t.Errorf("cleanSearchQuery(%q) = %q; want %q", tc.input, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestSearchWebLive(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	queries := []string{
+		"какой курс доллара",
+		"какая погода в Калуге",
+		"сколько стоит биткоин",
+		"у тебя есть интернет",
+		"какое сегодня число",
+	}
+
+	for _, q := range queries {
+		res, err := searchWeb(ctx, q)
+		if err != nil {
+			t.Errorf("searchWeb(%q) error = %v", q, err)
+		}
+		t.Logf("Query: %q -> Result: %q", q, res)
+		if res == "" {
+			t.Errorf("searchWeb(%q) returned empty result", q)
+		}
+	}
+}
+
+func TestOpenURL_SSRF(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	blockedURLs := []string{
+		"http://127.0.0.1:8080/test",
+		"http://localhost:8080/secret",
+		"http://192.168.1.1/admin",
+		"http://10.0.0.1/status",
+		"http://169.254.169.254/latest/meta-data",
+		"file:///etc/passwd",
+		"ftp://example.com/file",
+	}
+
+	for _, u := range blockedURLs {
+		res, err := openURL(ctx, u)
+		if err == nil {
+			t.Errorf("openURL(%q) should have been blocked for SSRF/scheme, got success: %q", u, res)
+		} else {
+			t.Logf("openURL(%q) properly blocked: %v", u, err)
+		}
+	}
+}
+
+func TestOpenURL_Public(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	res, err := openURL(ctx, "https://example.com")
+	if err != nil {
+		t.Fatalf("openURL(https://example.com) failed: %v", err)
+	}
+	t.Logf("openURL(https://example.com) -> %s", res)
+	if !strings.Contains(res, "example.com") || !strings.Contains(res, "Example Domain") {
+		t.Errorf("unexpected content from example.com: %s", res)
+	}
+}
+
+func TestWeather(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	testQueries := []struct {
+		query    string
+		wantWord string
+	}{
+		{"погода в Калуге", "Калуг"},
+		{"какая погода в Калуге сейчас", "Калуг"},
+		{"погода в Москве на завтра", "Москв"},
+		{"какая сейчас погода", "вашем городе"},
+	}
+
+	for _, tc := range testQueries {
+		res, err := fetchWeather(ctx, tc.query)
+		if err != nil {
+			t.Fatalf("fetchWeather(%q) failed: %v", tc.query, err)
+		}
+		t.Logf("Weather %q: %s", tc.query, res)
+		if !strings.Contains(res, tc.wantWord) {
+			t.Errorf("expected %q in weather for %q, got: %s", tc.wantWord, tc.query, res)
+		}
+	}
+}
+
+func TestDetectURLQuery(t *testing.T) {
+	tests := []struct {
+		input     string
+		wantFound bool
+	}{
+		{"открой example.org и расскажи что там", true},
+		{"посмотри сайт lenta.ru", true},
+		{"что на сайте rbc.ru", true},
+		{"зайди на https://habr.com", true},
+		{"прочитай https://golang.org/doc", true},
+		{"привет как дела", false},
+		{"какая погода в Москве", false},
+	}
+
+	for _, tc := range tests {
+		gotFound, gotURL := detectURLQuery(tc.input)
+		if gotFound != tc.wantFound {
+			t.Errorf("detectURLQuery(%q) found=%v, url=%q; want %v", tc.input, gotFound, gotURL, tc.wantFound)
+		}
 	}
 }

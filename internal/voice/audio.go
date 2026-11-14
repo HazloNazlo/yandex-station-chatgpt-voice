@@ -25,7 +25,7 @@ import (
 	"github.com/pion/webrtc/v4/pkg/media/samplebuilder"
 )
 
-const playbackQueueFrames = 30
+const playbackQueueFrames = 12
 const stereoFrameBytes = stereoChannels * pcmSampleBytes
 
 const captureSampleRate = 16000
@@ -69,6 +69,7 @@ type audio struct {
 	drained       chan struct{}
 	ackDrain      func()
 	stopping      atomic.Bool
+	muted         atomic.Bool
 	current       playbackBlock
 	currentAt     int
 	lastAudioTime atomic.Int64
@@ -85,6 +86,14 @@ func newAudio(epoch *stationEpoch) *audio {
 }
 
 func (a *audio) finish(ctx context.Context) error {
+	if a == nil {
+		return nil
+	}
+	if a.muted.Load() {
+		a.flushPlayback()
+		a.ackDrain()
+		return nil
+	}
 	a.queueMu.Lock()
 	a.finishing.Store(true)
 	a.queueMu.Unlock()
@@ -160,11 +169,11 @@ func (a *audio) close() error {
 
 func (a *audio) callback(output, _ []byte, frames uint32) {
 	clear(output)
-	if !a.epoch.allowed() {
+	if a.finishing.Load() && (a.muted.Load() || (a.currentAt >= a.current.used && len(a.playback) == 0)) {
+		a.ackDrain()
 		return
 	}
-	if a.finishing.Load() && a.currentAt >= a.current.used && len(a.playback) == 0 {
-		a.ackDrain()
+	if !a.epoch.allowed() || a.muted.Load() {
 		return
 	}
 	for i := range min(int(frames), len(output)/stereoFrameBytes) {
@@ -249,6 +258,9 @@ func (a *audio) send(ctx context.Context, track *webrtc.TrackLocalStaticSample, 
 }
 
 func (a *audio) queueDecoded(pcm []int16) {
+	if a.muted.Load() {
+		return
+	}
 	a.queueMu.Lock()
 	defer a.queueMu.Unlock()
 	if !a.epoch.allowed() || a.finishing.Load() {
@@ -286,6 +298,16 @@ func (a *audio) flushPlayback() {
 		case <-a.playback:
 		default:
 		}
+	}
+}
+
+func (a *audio) mutePlayback(mute bool) {
+	if a == nil {
+		return
+	}
+	a.muted.Store(mute)
+	if mute {
+		a.flushPlayback()
 	}
 }
 
