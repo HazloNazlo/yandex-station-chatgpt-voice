@@ -349,6 +349,7 @@ func parseHangupCommand(text string) (bool, string) {
 		"заверши звонок", "завершить звонок", "закончи разговор", "закончить разговор",
 		"закрой разговор", "закрой сесси", "отключи сесси", "останови сесси",
 		"останови разговор", "положи трубку", "конец связи", "прекрати разговор",
+		"замолчи", "заткнись",
 	}
 	for _, phrase := range explicitPhrases {
 		if strings.Contains(lower, phrase) {
@@ -401,10 +402,11 @@ func parseHangupCommand(text string) (bool, string) {
 	}
 
 	if hasPoka {
-		// "пока что", "пока не", "пока нет", "пока ты", "пока я" -> NOT hangup!
+		// "пока что", "пока не", "пока нет", "пока ты", "пока я", "пока ещё" -> NOT hangup!
 		if pokaIdx+1 < len(cleanWords) {
 			next := cleanWords[pokaIdx+1]
-			if next == "что" || next == "не" || next == "нет" || next == "ты" || next == "я" || next == "мы" {
+			if next == "что" || next == "не" || next == "нет" || next == "ты" || next == "я" || next == "мы" ||
+				next == "еще" || next == "ещё" || next == "он" || next == "она" || next == "они" {
 				return false, ""
 			}
 		}
@@ -484,64 +486,94 @@ func cleanSearchQuery(text string) string {
 }
 
 func detectSearchQuery(text string) (bool, string) {
-	lower := strings.ToLower(strings.TrimSpace(text))
+	trimmed := strings.TrimSpace(text)
+	lower := strings.ToLower(trimmed)
 
-	// 0. Capability inquiry / internet test
-	if (strings.Contains(lower, "доступ") && strings.Contains(lower, "интернет")) ||
-		(strings.Contains(lower, "duckduckgo") && (strings.Contains(lower, "доступ") || strings.Contains(lower, "можешь") || strings.Contains(lower, "умеешь") || strings.Contains(lower, "есть"))) ||
-		strings.Contains(lower, "у тебя есть интернет") || strings.Contains(lower, "ты в интернете") ||
-		strings.Contains(lower, "ты подключен к интернету") || strings.Contains(lower, "ты подключена к интернету") ||
-		strings.Contains(lower, "проверь интернет") || strings.Contains(lower, "проверь связь") ||
-		strings.Contains(lower, "проверка интернета") || strings.Contains(lower, "работает ли интернет") ||
-		strings.Contains(lower, "есть интернет") || strings.Contains(lower, "есть доступ в интернет") {
-		return true, strings.TrimSpace(text)
+	fields := strings.FieldsFunc(lower, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
+	if len(fields) == 0 {
+		return false, ""
 	}
 
-	// 1. Direct search mentions
+	fullClean := strings.Join(fields, " ")
+
+	// 0. Filter out small talk and greetings
+	smallTalkPhrases := []string{
+		"привет", "приветствую", "здравствуй", "здравствуйте", "доброе утро",
+		"добрый день", "добрый вечер", "доброй ночи", "как дела", "как твои дела",
+		"как поживаешь", "как жизнь", "как настроение", "как сам", "ты кто",
+		"как тебя зовут", "спасибо", "большое спасибо", "понял", "понятно",
+		"ясно", "хорошо", "ладно", "отлично", "круто", "супер", "окей",
+	}
+	for _, st := range smallTalkPhrases {
+		if fullClean == st {
+			return false, ""
+		}
+	}
+
+	// 1. Internet capability / verification
 	if strings.Contains(lower, "интернет") || strings.Contains(lower, "duckduckgo") ||
-		strings.Contains(lower, "дакдакго") || strings.Contains(lower, "дактдакго") ||
-		strings.Contains(lower, "википеди") || strings.Contains(lower, "в гугле") ||
-		strings.Contains(lower, "в яндексе") || strings.Contains(lower, "погугли") ||
-		strings.Contains(lower, "загугли") {
-		return true, strings.TrimSpace(text)
+		strings.Contains(lower, "википеди") || strings.Contains(lower, "гугл") ||
+		strings.Contains(lower, "яндекс") || strings.Contains(lower, "погугли") ||
+		strings.Contains(lower, "загугли") || strings.Contains(lower, "связь") ||
+		strings.Contains(lower, "доступ в сеть") || strings.Contains(lower, "онлайн") {
+		return true, trimmed
 	}
 
-	// 2. Explicit triggers
-	reExplicit := regexp.MustCompile(`(?:найди|поищи|посмотри|глянь|пробей|узнай|проверь|досмотри|поиск|покажи)\s*(?:в интернете|в сети|в новостях|в википедии)?\s*(.*)`)
-	if m := reExplicit.FindStringSubmatch(lower); len(m) > 1 {
-		q := strings.TrimSpace(m[1])
-		if len(q) > 2 {
-			return true, strings.TrimSpace(text)
-		}
-	}
-
-	// 3. Question words requiring fresh info
-	questionTriggers := []string{
-		"кто такой", "кто такая", "кто такие", "что такое", "где находится",
-		"где располож", "когда выйдет", "когда был", "когда будет", "сколько стоит",
-		"какая цена", "что случилось", "что произошло", "какой счет", "кто выиграл",
-		"кто победил", "последние новости", "свежие новости", "что нового", "какой сейчас",
-		"история появления", "история создания", "история породы", "почему", "зачем",
-		"как устроена", "как устроен", "как работает", "в каком году", "в каком городе",
-	}
-	for _, qtr := range questionTriggers {
-		if strings.Contains(lower, qtr) {
-			return true, strings.TrimSpace(text)
-		}
-	}
-
-	// 4. Keywords requiring fresh data
-	triggers := []string{
-		"курс", "доллар", "евро", "юан", "биткоин", "bitcoin", "btc", "крипт", "валют", "акци",
-		"погод", "температур", "прогноз", "градус", "дождь", "снег",
-		"новост", "событи", "дайджест", "сводка",
+	// 2. Real-time data keywords (Currency, Crypto, Weather, Time, News)
+	dataKeywords := []string{
+		"курс", "доллар", "евро", "юан", "валют", "рубл",
+		"биткоин", "bitcoin", "btc", "крипт", "эфириум", "eth",
+		"погод", "температур", "прогноз", "градус", "дождь", "снег", "ветер",
+		"новост", "событи", "сводка", "дайджест",
 		"число", "день недели", "который час", "сколько времени", "какая дата",
 	}
-
-	for _, trig := range triggers {
-		if strings.Contains(lower, trig) {
-			return true, strings.TrimSpace(text)
+	for _, kw := range dataKeywords {
+		if strings.Contains(lower, kw) {
+			return true, trimmed
 		}
+	}
+
+	// 3. Information verbs
+	infoVerbs := []string{
+		"расскажи", "объясни", "назови", "найди", "поищи", "посмотри",
+		"узнай", "проверь", "покажи", "перечисли", "опиши", "подскажи",
+	}
+	for _, v := range infoVerbs {
+		for _, w := range fields {
+			if w == v {
+				return true, trimmed
+			}
+		}
+	}
+
+	// 4. Question words at beginning of sentence
+	firstWord := fields[0]
+	if len(fields) > 1 && (firstWord == "а" || firstWord == "и" || firstWord == "ну" || firstWord == "скажи") {
+		firstWord = fields[1]
+	}
+
+	questionWords := map[string]bool{
+		"кто": true, "что": true, "где": true, "когда": true, "куда": true,
+		"откуда": true, "почему": true, "зачем": true, "сколько": true,
+		"какой": true, "какая": true, "какое": true, "какие": true,
+		"каком": true, "каких": true, "чей": true, "чья": true, "чьё": true,
+		"чьи": true, "чем": true, "кем": true, "кому": true, "чему": true,
+	}
+
+	if questionWords[firstWord] {
+		return true, trimmed
+	}
+
+	// "как" (ensure not "как дела", "как ты", "как настроение", "как поживаешь")
+	if firstWord == "как" && len(fields) > 1 && fields[1] != "дела" && fields[1] != "ты" && fields[1] != "настроение" && fields[1] != "поживаешь" {
+		return true, trimmed
+	}
+
+	// Question mark at the end with 3 or more words
+	if strings.HasSuffix(trimmed, "?") && len(fields) >= 3 {
+		return true, trimmed
 	}
 
 	return false, ""

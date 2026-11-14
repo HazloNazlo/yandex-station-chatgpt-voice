@@ -55,10 +55,11 @@ type peer struct {
 	callsMu      sync.Mutex
 	seenCalls    map[string]bool
 	audio        *audio
-	userMu       sync.Mutex
-	userTextBuf  strings.Builder
-	isUserMsg    bool
-	lastActivity atomic.Int64
+	userMu        sync.Mutex
+	userTextBuf   strings.Builder
+	isUserMsg     bool
+	lastActivity  atomic.Int64
+	hasUserSpoken atomic.Bool
 }
 
 //nolint:funlen,gocognit // Callback closures share peer teardown and cancellation state; keep their registration together.
@@ -399,6 +400,7 @@ func (p *peer) handleMessage(data []byte) {
 				p.userMu.Unlock()
 
 				if fullText != "" {
+					p.hasUserSpoken.Store(true)
 					p.report.Printf("User speech recognized: %q", fullText)
 					p.lastActivity.Store(time.Now().Unix())
 
@@ -455,9 +457,6 @@ func (p *peer) handleMessage(data []byte) {
 
 					// 4. Web search check
 					if needSearch, query := detectSearchQuery(fullText); needSearch {
-						if p.audio != nil {
-							p.audio.flushPlayback()
-						}
 						p.wg.Go(func() {
 							p.report.Printf("Web search triggered for: %q", query)
 							searchCtx, cancel := context.WithTimeout(p.ctx, 4*time.Second)
@@ -469,9 +468,6 @@ func (p *peer) handleMessage(data []byte) {
 							}
 							p.report.Printf("Search completed. Sending relay text to ChatGPT...")
 							relayPrompt := fmt.Sprintf("[Данные из интернета]: Ты голосовой ассистент на умной колонке Яндекс Станция. У тебя есть постоянный доступ в интернет. Используй эти проверенные данные, чтобы емко и четко ответить пользователю на его вопрос %q:\n%s", query, results)
-							if p.audio != nil {
-								p.audio.flushPlayback()
-							}
 							if err := p.sendRelayText(relayPrompt); err != nil {
 								p.report.Printf("Failed to send relay search: %v", err)
 							} else {
@@ -487,9 +483,6 @@ func (p *peer) handleMessage(data []byte) {
 
 	case "input_audio_buffer.speech_started":
 		p.lastActivity.Store(time.Now().Unix())
-		if p.audio != nil {
-			p.audio.flushPlayback()
-		}
 	}
 
 	calls := parseToolCalls(data)
@@ -888,8 +881,19 @@ func runCall(e *stationEpoch, sessionFile string, capture *stationCapture, setti
 					continue
 				}
 				last := p.lastActivity.Load()
-				if last > 0 && time.Now().Unix()-last > 90 {
-					p.report.Print("Session silence timeout (90s inactivity); ending call gracefully.")
+				if last == 0 {
+					continue
+				}
+				timeout := int64(90)
+				if !p.hasUserSpoken.Load() {
+					timeout = 25
+				}
+				if time.Now().Unix()-last > timeout {
+					if !p.hasUserSpoken.Load() {
+						p.report.Print("Initial silence timeout (25s without speech); ending call.")
+					} else {
+						p.report.Print("Conversational silence timeout (90s inactivity); ending call gracefully.")
+					}
 					p.cancel(errProtocolHangup)
 					return
 				}
