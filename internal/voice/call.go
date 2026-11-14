@@ -57,6 +57,7 @@ type peer struct {
 	audio        *audio
 	userMu        sync.Mutex
 	userTextBuf   strings.Builder
+	asstTextBuf   strings.Builder
 	isUserMsg     bool
 	lastActivity  atomic.Int64
 	hasUserSpoken atomic.Bool
@@ -350,6 +351,10 @@ func (p *peer) handleMessage(data []byte) {
 						if p.isUserMsg {
 							finished = true
 						}
+						p.asstTextBuf.Reset()
+						for _, pt := range addMsg.Message.Content.Parts {
+							p.asstTextBuf.WriteString(pt.Text)
+						}
 					}
 				}
 			}
@@ -364,10 +369,12 @@ func (p *peer) handleMessage(data []byte) {
 				if json.Unmarshal(cmd.Delta.V, &patches) == nil {
 					for _, pt := range patches {
 						if pt.O == "append" && strings.HasPrefix(pt.P, "/message/content/parts/") {
-							if p.isUserMsg {
-								var textPart string
-								if json.Unmarshal(pt.V, &textPart) == nil {
+							var textPart string
+							if json.Unmarshal(pt.V, &textPart) == nil {
+								if p.isUserMsg {
 									p.userTextBuf.WriteString(textPart)
+								} else {
+									p.asstTextBuf.WriteString(textPart)
 								}
 							}
 						}
@@ -376,6 +383,12 @@ func (p *peer) handleMessage(data []byte) {
 							if json.Unmarshal(pt.V, &status) == nil && status == "finished_successfully" {
 								if p.isUserMsg {
 									finished = true
+								} else {
+									asstText := strings.TrimSpace(p.asstTextBuf.String())
+									if asstText != "" {
+										p.report.Printf("Assistant speech: %q", asstText)
+									}
+									p.asstTextBuf.Reset()
 								}
 							}
 						}
@@ -389,6 +402,12 @@ func (p *peer) handleMessage(data []byte) {
 				if json.Unmarshal(cmd.Delta.V, &val) == nil && val == "finished_successfully" {
 					if p.isUserMsg {
 						finished = true
+					} else {
+						asstText := strings.TrimSpace(p.asstTextBuf.String())
+						if asstText != "" {
+							p.report.Printf("Assistant speech: %q", asstText)
+						}
+						p.asstTextBuf.Reset()
 					}
 				}
 			}
@@ -405,10 +424,18 @@ func (p *peer) handleMessage(data []byte) {
 					p.lastActivity.Store(time.Now().Unix())
 
 					// 1. Hangup check: "пока", "до свидания", "отбой", "стоп", "хватит", "заверши сессию"
-					if isHangup, _ := parseHangupCommand(fullText); isHangup {
+					if isHangup, farewellMsg := parseHangupCommand(fullText); isHangup {
 						p.report.Printf("Hangup command triggered by speech: %q", fullText)
 						p.wg.Go(func() {
-							time.Sleep(1200 * time.Millisecond)
+							if p.audio != nil {
+								p.audio.mutePlayback(true)
+							}
+							if farewellMsg != "" {
+								playCtx, playCancel := context.WithTimeout(p.ctx, 4*time.Second)
+								_ = playSpeech(playCtx, farewellMsg)
+								playCancel()
+							}
+							time.Sleep(200 * time.Millisecond)
 							p.cancel(errProtocolHangup)
 						})
 						return
@@ -424,15 +451,22 @@ func (p *peer) handleMessage(data []byte) {
 								}
 							}
 							if p.audio != nil {
-								p.audio.flushPlayback()
+								p.audio.mutePlayback(true)
 							}
 							if msg != "" {
-								_ = p.sendRelayText(fmt.Sprintf("Скажи пользователю строго следующее: %s", msg))
+								playCtx, playCancel := context.WithTimeout(p.ctx, 15*time.Second)
+								_ = playSpeech(playCtx, msg)
+								playCancel()
+								p.lastActivity.Store(time.Now().Unix())
+								_ = p.sendRelayText(fmt.Sprintf("[Ответ пользователю озвучен]: %s", msg))
 							}
 							if newVoice != "" {
-								// Wait 3.5s for confirmation to be spoken, then hang up so next "Яндекс" starts with new voice
-								time.Sleep(3500 * time.Millisecond)
+								time.Sleep(300 * time.Millisecond)
 								p.cancel(errProtocolHangup)
+							} else {
+								if p.audio != nil {
+									p.audio.mutePlayback(false)
+								}
 							}
 						})
 						return
@@ -466,16 +500,23 @@ func (p *peer) handleMessage(data []byte) {
 								p.report.Printf("Search error: %v", err)
 								return
 							}
-							p.report.Printf("Search completed. Sending relay text to ChatGPT...")
+							p.report.Printf("Search completed: %s", results)
 							if p.audio != nil {
-								p.audio.flushPlayback()
+								p.audio.mutePlayback(true)
 							}
-							relayPrompt := fmt.Sprintf("[Данные из интернета]: Ты голосовой ассистент на умной колонке Яндекс Станция. У тебя есть постоянный доступ в интернет. Используй эти проверенные данные, чтобы емко и четко ответить пользователю на его вопрос %q:\n%s", query, results)
-							if err := p.sendRelayText(relayPrompt); err != nil {
-								p.report.Printf("Failed to send relay search: %v", err)
+							playCtx, playCancel := context.WithTimeout(p.ctx, 20*time.Second)
+							if playErr := playSpeech(playCtx, results); playErr != nil {
+								p.report.Printf("playSpeech error: %v", playErr)
 							} else {
-								p.report.Print("Relay search info delivered to ChatGPT.")
+								p.report.Print("Spoken live answer played through speaker successfully.")
 							}
+							playCancel()
+							p.lastActivity.Store(time.Now().Unix())
+							if p.audio != nil {
+								time.Sleep(300 * time.Millisecond)
+								p.audio.mutePlayback(false)
+							}
+							_ = p.sendRelayText(fmt.Sprintf("[Ответ пользователю уже озвучен]: %s", results))
 						})
 					}
 				}
