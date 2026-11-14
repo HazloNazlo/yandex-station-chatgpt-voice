@@ -297,6 +297,67 @@ This gate requires a separate local/temporary app-server harness using the pinne
 
 This is not yet a supported OpenAI public voice API; the realtime extension is experimental/private. Do not connect the Station or use real tools until this isolated test works.
 
+## Observed result on this Free account (14 November 2026)
+
+The user completed Gates 1 and 2 on a Mac Mini using Codex CLI 0.169.0:
+
+- `codex login status`: `Logged in using ChatGPT`.
+- Model: `gpt-6-luna`.
+- Sandbox: `read-only`.
+- Prompt returned exactly `CODEX_FREE_OK`.
+
+The user then completed Gate 3A successfully. Observed output:
+
+```text
+APP_SERVER_INITIALIZED: macos
+EPHEMERAL_THREAD_STARTED
+MODEL_TURN_STARTED
+DYNAMIC_TOOL_REQUEST: diagnostic_ping {"message":"ping from ChatGPT Free App Server"}
+DYNAMIC_TOOL_RESULT_SENT
+PASS: Codex App Server called diagnostic_ping and accepted its result.
+```
+
+This proves, for the tested Free account and CLI 0.169.0, ChatGPT OAuth, a Codex CLI inference, App Server startup, experimental API initialization, dynamic tool registration, a model-selected server tool call, and the JSON tool-result round trip. It does **not** yet prove realtime voice eligibility or audible output.
+
+## Gate 4A — realtime WebSocket handoff, text-injected input
+
+The next test uses the App Server's own WebSocket realtime transport, so no browser, microphone, SDP offer, or extra npm packages are needed. It injects one text utterance through the realtime API (as a stand-in for a recognized utterance), and asks the realtime voice surface to hand the task to the Codex execution agent.
+
+This tests the realtime service and native handoff while deliberately postponing actual audio capture/playback. It is not yet a test of the Station or of WebRTC.
+
+Download the smoke-test script from the current documentation branch:
+
+```bash
+curl -fsSL "https://raw.githubusercontent.com/HazloNazlo/yandex-station-chatgpt-voice/docs/browser-session-tools-audit/tools/realtime_bridge_smoke.mjs" -o "$HOME/realtime_bridge_smoke.mjs"
+node "$HOME/realtime_bridge_smoke.mjs"
+```
+
+The script:
+- starts the existing local Codex App Server using the existing ChatGPT CLI login (it removes `OPENAI_API_KEY` from the child environment and never reads or prints token files);
+- starts an ephemeral read-only thread using `gpt-6-luna`;
+- registers only `diagnostic_ping` and `speak_to_user`;
+- opens an experimental Realtime V3 WebSocket session with audio output;
+- appends a simulated user utterance;
+- records the native `handoff_request`, both dynamic tool calls, the `appendSpeech` acknowledgement, and any realtime audio chunks;
+- stops the realtime session and the App Server process.
+
+Expected success markers include:
+
+```text
+REALTIME_SESSION_STARTED: yes
+NATIVE_HANDOFF: ...
+TOOL_REQUEST: diagnostic_ping ...
+DIAGNOSTIC_PING_RESULT_SENT
+TOOL_REQUEST: speak_to_user ...
+SPEECH_APPENDED_TO_REALTIME: ...
+PASS: realtime session handed off to diagnostic_ping and accepted spoken result.
+REALTIME_OUTPUT_AUDIO_OBSERVED: yes
+```
+
+A successful `appendSpeech` request proves that the execution agent sent speech text into the same realtime session. Audio chunk notifications provide additional evidence that the realtime output path generated audio, but this script does not play the audio on the Mac speakers. If no output audio chunks arrive, report that as a separate result: do not treat the accepted appendSpeech response alone as proof of audible playback.
+
+The test can fail because the realtime feature is not enabled for the account, the upstream realtime model is unavailable, or the protocol version changed. Do not enable the removed `realtime_conversation` compatibility flag. Capture the exact sanitized error and stop; do not switch to API-key auth.
+
 ## What to send back
 
 Paste only the following non-secret outputs:
