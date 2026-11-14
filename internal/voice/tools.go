@@ -2,6 +2,7 @@ package voice
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
@@ -18,6 +19,27 @@ import (
 	"strings"
 	"sync"
 	"time"
+)
+
+var sharedHTTPClient = &http.Client{
+	Timeout: 4 * time.Second,
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		DialContext: (&net.Dialer{
+			Timeout:   3 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+	},
+}
+
+var (
+	cbrMu       sync.Mutex
+	cbrCached   string
+	cbrCachedAt time.Time
+
+	weatherMu       sync.Mutex
+	weatherCached   = make(map[string]string)
+	weatherCachedAt = make(map[string]time.Time)
 )
 
 func init() {
@@ -234,43 +256,60 @@ func parseVolumeCommand(text string) (bool, int, int) {
 func parseVoiceCommand(text string) (bool, string, string) {
 	lower := strings.ToLower(strings.TrimSpace(text))
 
-	// Inquiry about voices
-	if strings.Contains(lower, "какие есть голоса") || strings.Contains(lower, "какой у тебя голос") ||
-		strings.Contains(lower, "какие голоса доступны") || strings.Contains(lower, "список голосов") ||
-		strings.Contains(lower, "какой голос установлен") {
+	// 1. Inquiry about voices: "какие голоса у тебя есть", "какой голос", "список голосов"
+	if (strings.Contains(lower, "голос") || strings.Contains(lower, "голоса")) &&
+		(strings.Contains(lower, "как") || strings.Contains(lower, "каки") || strings.Contains(lower, "список") ||
+			strings.Contains(lower, "вариант") || strings.Contains(lower, "доступн") || strings.Contains(lower, "выбрат") ||
+			strings.Contains(lower, "перечисл") || strings.Contains(lower, "какой")) {
 		cur := getSavedVoice()
-		msg := fmt.Sprintf("Сейчас включен голос %s. Доступны: мужские Orbit, Breeze, Cove, Ember, Spruce, Arbor, и женские Vale, Juniper, Sky, Sol, Maple. Чтобы переключить, скажи «Смени голос» или назови конкретный.", cur)
+		msg := fmt.Sprintf("Сейчас включен голос %s. Доступны женские голоса: Vale, Juniper, Sky, Sol, Maple, и мужские: Breeze, Orbit, Cove, Ember, Spruce, Arbor. Чтобы переключить, скажи «Смени голос на женский» или назови конкретный голос.", cur)
 		return true, "", msg
 	}
 
-	// Next voice cycle
-	if strings.Contains(lower, "смени голос") || strings.Contains(lower, "поменяй голос") ||
-		strings.Contains(lower, "следующий голос") || strings.Contains(lower, "другой голос") ||
-		strings.Contains(lower, "переключи голос") {
+	// 2. Female voice switch
+	if (strings.Contains(lower, "женск") || strings.Contains(lower, "девушк") || strings.Contains(lower, "женщин")) &&
+		(strings.Contains(lower, "голос") || strings.Contains(lower, "поставь") || strings.Contains(lower, "включи") || strings.Contains(lower, "смен") || strings.Contains(lower, "с мини")) {
+		next := "vale"
+		msg := "Голос изменен на женский Vale! Скажи «Яндекс», чтобы продолжить уже с новым голосом."
+		return true, next, msg
+	}
+
+	// 3. Male voice switch
+	if (strings.Contains(lower, "мужск") || strings.Contains(lower, "парн") || strings.Contains(lower, "мужчин")) &&
+		(strings.Contains(lower, "голос") || strings.Contains(lower, "поставь") || strings.Contains(lower, "включи") || strings.Contains(lower, "смен") || strings.Contains(lower, "с мини")) {
+		next := "breeze"
+		msg := "Голос изменен на мужской Breeze! Скажи «Яндекс», чтобы продолжить уже с новым голосом."
+		return true, next, msg
+	}
+
+	// 4. Specific voice names
+	namedVoices := map[string]string{
+		"vale": "vale", "вэйл": "vale", "вейл": "vale", "валя": "vale",
+		"breeze": "breeze", "бриз": "breeze",
+		"orbit": "orbit", "орбит": "orbit",
+		"juniper": "juniper", "джунипер": "juniper",
+		"sky": "sky", "скай": "sky",
+		"cove": "cove", "коув": "cove", "ков": "cove",
+		"ember": "ember", "эмбер": "ember",
+		"sol": "sol", "сол": "sol",
+		"maple": "maple", "мейпл": "maple",
+		"spruce": "spruce", "спрус": "spruce",
+		"arbor": "arbor", "арбор": "arbor",
+	}
+	for name, target := range namedVoices {
+		if strings.Contains(lower, name) && (strings.Contains(lower, "голос") || strings.Contains(lower, "поставь") || strings.Contains(lower, "включи") || strings.Contains(lower, "выбери") || strings.Contains(lower, "смен") || strings.Contains(lower, "с мини")) {
+			msg := fmt.Sprintf("Голос изменен на %s! Скажи «Яндекс», чтобы продолжить с новым голосом.", target)
+			return true, target, msg
+		}
+	}
+
+	// 5. Next / cycle voice
+	if (strings.Contains(lower, "смен") || strings.Contains(lower, "помен") || strings.Contains(lower, "переключ") || strings.Contains(lower, "следующ") || strings.Contains(lower, "друг") || strings.Contains(lower, "с мини")) &&
+		(strings.Contains(lower, "голос") || strings.Contains(lower, "голоса")) {
 		cur := getSavedVoice()
 		next := nextVoice(cur)
-		msg := fmt.Sprintf("Переключаю голос на %s! При следующем вызове буду говорить им.", next)
+		msg := fmt.Sprintf("Голос изменен на %s! Скажи «Яндекс», чтобы продолжить с новым голосом.", next)
 		return true, next, msg
-	}
-
-	// Gender presets
-	if strings.Contains(lower, "женский голос") || strings.Contains(lower, "голос девушк") || (strings.Contains(lower, "девушк") && strings.Contains(lower, "голос")) {
-		next := "vale"
-		msg := "Переключаю на выразительный женский голос Vale! Переключаюсь."
-		return true, next, msg
-	}
-	if strings.Contains(lower, "мужской голос") || strings.Contains(lower, "голос парн") || (strings.Contains(lower, "парн") && strings.Contains(lower, "голос")) {
-		next := "breeze"
-		msg := "Переключаю на живой мужской голос Breeze! Переключаюсь."
-		return true, next, msg
-	}
-
-	// Specific voice names
-	for _, name := range availableVoices {
-		if strings.Contains(lower, name) && (strings.Contains(lower, "голос") || strings.Contains(lower, "поставь") || strings.Contains(lower, "включи") || strings.Contains(lower, "выбери")) {
-			msg := fmt.Sprintf("Переключаю голос на %s. При следующем вызове заговорю новым голосом!", name)
-			return true, name, msg
-		}
 	}
 
 	return false, "", ""
@@ -297,56 +336,18 @@ func parseHangupCommand(text string) (bool, string) {
 	lower := strings.ToLower(strings.TrimSpace(text))
 	lower = strings.Trim(lower, ".!?,;:")
 
-	farewells := map[string]string{
-		"пока":               "Пока! Хорошего дня!",
-		"пока пока":          "Пока-пока!",
-		"пока-пока":          "Пока-пока!",
-		"до свидания":        "До свидания!",
-		"до встречи":         "До встречи!",
-		"до связи":           "До связи!",
-		"отбой":              "Отбой!",
-		"стоп":               "Останавливаюсь.",
-		"хватит":             "Понял, закругляюсь.",
-		"заверши сессию":     "Завершаю сессию, до встречи!",
-		"завершить сессию":   "Завершаю сессию, до встречи!",
-		"заверши разговор":   "Завершаю разговор. До связи!",
-		"завершить разговор": "Завершаю разговор. До связи!",
-		"отключись":          "Отключаюсь!",
-		"выключись":          "Отключаюсь!",
-		"спасибо пока":       "Пожалуйста! До связи!",
-		"спасибо, пока":      "Пожалуйста! До связи!",
-		"все пока":           "До скорого!",
-		"всё пока":           "До скорого!",
-		"конец связи":        "Конец связи!",
-	}
-
-	if msg, ok := farewells[lower]; ok {
-		return true, msg
-	}
-
-	for phrase, msg := range farewells {
-		if strings.HasPrefix(lower, phrase) || strings.HasSuffix(lower, phrase) {
-			return true, msg
-		}
-	}
-
-	triggers := []string{
+	farewells := []string{
+		"пока", "до свидания", "до встречи", "до связи", "отбой", "стоп", "хватит",
 		"заверши сесси", "завершить сесси", "заверши разговор", "завершить разговор",
 		"закрой разговор", "закрой сесси", "отключи сесси", "останови сесси",
-	}
-	for _, tr := range triggers {
-		if strings.Contains(lower, tr) {
-			return true, "Завершаю разговор. До связи!"
-		}
+		"отключись", "выключись", "конец связи",
 	}
 
-	if len([]rune(lower)) <= 15 {
-		if strings.HasPrefix(lower, "пока") || strings.HasPrefix(lower, "отбой") ||
-			strings.HasPrefix(lower, "стоп") || strings.HasPrefix(lower, "хватит") {
-			return true, "Пока!"
+	for _, f := range farewells {
+		if strings.Contains(lower, f) {
+			return true, "До связи!"
 		}
 	}
-
 	return false, ""
 }
 
@@ -455,12 +456,19 @@ func handleSetVolume(argsJSON string) (string, error) {
 }
 
 func fetchCBRRates(ctx context.Context) (string, error) {
+	cbrMu.Lock()
+	if cbrCached != "" && time.Since(cbrCachedAt) < 30*time.Minute {
+		res := cbrCached
+		cbrMu.Unlock()
+		return res, nil
+	}
+	cbrMu.Unlock()
+
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "https://www.cbr-xml-daily.ru/daily_json.js", nil)
 	if err != nil {
 		return "", err
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -481,20 +489,27 @@ func fetchCBRRates(ctx context.Context) (string, error) {
 	}
 
 	var sb strings.Builder
-	sb.WriteString("Официальные курсы валют ЦБ РФ:\n")
-	for _, code := range []string{"USD", "EUR", "CNY"} {
-		if v, ok := data.Valute[code]; ok {
-			diff := v.Value - v.Previous
-			diffStr := ""
-			if diff > 0 {
-				diffStr = fmt.Sprintf(" (+%.2f)", diff)
-			} else if diff < 0 {
-				diffStr = fmt.Sprintf(" (%.2f)", diff)
-			}
-			sb.WriteString(fmt.Sprintf("- %s (%s): %.2f ₽%s\n", v.Name, v.CharCode, v.Value, diffStr))
-		}
+	sb.WriteString("Официальные курсы валют ЦБ РФ: ")
+	if usd, ok := data.Valute["USD"]; ok {
+		diff := usd.Value - usd.Previous
+		sb.WriteString(fmt.Sprintf("Доллар: %.2f ₽ (%+.2f), ", usd.Value, diff))
 	}
-	return sb.String(), nil
+	if eur, ok := data.Valute["EUR"]; ok {
+		diff := eur.Value - eur.Previous
+		sb.WriteString(fmt.Sprintf("Евро: %.2f ₽ (%+.2f), ", eur.Value, diff))
+	}
+	if cny, ok := data.Valute["CNY"]; ok {
+		diff := cny.Value - cny.Previous
+		sb.WriteString(fmt.Sprintf("Юань: %.2f ₽ (%+.2f).", cny.Value, diff))
+	}
+	result := sb.String()
+
+	cbrMu.Lock()
+	cbrCached = result
+	cbrCachedAt = time.Now()
+	cbrMu.Unlock()
+
+	return result, nil
 }
 
 func fetchCryptoPrice(ctx context.Context, symbol string) (string, error) {
@@ -503,8 +518,7 @@ func fetchCryptoPrice(ctx context.Context, symbol string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -531,14 +545,20 @@ func fetchWeather(ctx context.Context, query string) (string, error) {
 		city = m[1]
 	}
 
+	weatherMu.Lock()
+	if cached, ok := weatherCached[city]; ok && time.Since(weatherCachedAt[city]) < 15*time.Minute {
+		weatherMu.Unlock()
+		return cached, nil
+	}
+	weatherMu.Unlock()
+
 	reqURL := "https://wttr.in/" + url.PathEscape(city) + "?m&M&format=4&lang=ru"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("User-Agent", "curl/7.88.1")
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -552,7 +572,14 @@ func fetchWeather(ctx context.Context, query string) (string, error) {
 	if res == "" || strings.Contains(res, "Unknown location") {
 		return "", errors.New("location not found")
 	}
-	return fmt.Sprintf("Погода сейчас: %s", res), nil
+	result := fmt.Sprintf("Погода сейчас: %s", res)
+
+	weatherMu.Lock()
+	weatherCached[city] = result
+	weatherCachedAt[city] = time.Now()
+	weatherMu.Unlock()
+
+	return result, nil
 }
 
 func fetchWikipedia(ctx context.Context, query string) (string, error) {
@@ -561,8 +588,8 @@ func fetchWikipedia(ctx context.Context, query string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return "", err
 	}
@@ -610,8 +637,7 @@ func fetchDuckDuckGo(ctx context.Context, query string) (string, error) {
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
 	req.Header.Set("Accept-Language", "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7")
 
-	client := &http.Client{Timeout: 6 * time.Second}
-	resp, err := client.Do(req)
+	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {
 		return "", fmt.Errorf("search request failed: %w", err)
 	}
@@ -664,8 +690,11 @@ func searchWeb(ctx context.Context, query string) (string, error) {
 
 	// 0. Capability inquiry: does ChatGPT have internet / DuckDuckGo access?
 	if (strings.Contains(lower, "доступ") && strings.Contains(lower, "интернет")) ||
-		(strings.Contains(lower, "duckduckgo") && (strings.Contains(lower, "доступ") || strings.Contains(lower, "можешь") || strings.Contains(lower, "умеешь") || strings.Contains(lower, "есть"))) {
-		return "Да, у тебя есть полноценный доступ в интернет! Твоя Яндекс Станция подключена к поисковику DuckDuckGo, курсам валют ЦБ РФ, криптобиржам и прогнозу погоды. Ты можешь искать любую актуальную информацию в сети в реальном времени.", nil
+		(strings.Contains(lower, "duckduckgo") && (strings.Contains(lower, "доступ") || strings.Contains(lower, "можешь") || strings.Contains(lower, "умеешь") || strings.Contains(lower, "есть"))) ||
+		strings.Contains(lower, "у тебя есть интернет") || strings.Contains(lower, "ты в интернете") ||
+		strings.Contains(lower, "ты подключен к интернету") || strings.Contains(lower, "ты подключена к интернету") ||
+		strings.Contains(lower, "есть интернет") || strings.Contains(lower, "есть доступ в интернет") {
+		return "Да, у меня есть постоянный доступ в интернет! Я подключен к поисковику DuckDuckGo, официальным курсам валют ЦБ РФ, криптобиржам и прогнозу погоды. Я могу в реальном времени искать любую актуальную информацию.", nil
 	}
 
 	// 1. Time / Date query
@@ -705,13 +734,13 @@ func searchWeb(ctx context.Context, query string) (string, error) {
 		}
 	}
 
-	// 5. General search via DuckDuckGo POST
-	if res, err := fetchDuckDuckGo(ctx, trimmed); err == nil && res != "" {
+	// 5. Search via Wikipedia (instant 200ms encyclopedic facts)
+	if res, err := fetchWikipedia(ctx, trimmed); err == nil && res != "" {
 		return res, nil
 	}
 
-	// 6. Fallback to Wikipedia
-	if res, err := fetchWikipedia(ctx, trimmed); err == nil && res != "" {
+	// 6. Search via DuckDuckGo
+	if res, err := fetchDuckDuckGo(ctx, trimmed); err == nil && res != "" {
 		return res, nil
 	}
 

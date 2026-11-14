@@ -424,10 +424,10 @@ func (p *peer) handleMessage(data []byte) {
 								p.audio.flushPlayback()
 							}
 							if msg != "" {
-								_ = p.sendRelayText(fmt.Sprintf("[Команда]: Скажи пользователю: %s", msg))
+								_ = p.sendRelayText(fmt.Sprintf("Скажи пользователю строго следующее: %s", msg))
 							}
 							if newVoice != "" {
-								// Wait for confirmation to be spoken, then hang up to activate new voice on next session
+								// Wait 3.5s for confirmation to be spoken, then hang up so next "Яндекс" starts with new voice
 								time.Sleep(3500 * time.Millisecond)
 								p.cancel(errProtocolHangup)
 							}
@@ -459,7 +459,7 @@ func (p *peer) handleMessage(data []byte) {
 						}
 						p.wg.Go(func() {
 							p.report.Printf("Web search triggered for: %q", query)
-							searchCtx, cancel := context.WithTimeout(p.ctx, 7*time.Second)
+							searchCtx, cancel := context.WithTimeout(p.ctx, 4*time.Second)
 							defer cancel()
 							results, err := searchWeb(searchCtx, query)
 							if err != nil {
@@ -467,7 +467,7 @@ func (p *peer) handleMessage(data []byte) {
 								return
 							}
 							p.report.Printf("Search completed. Sending relay text to ChatGPT...")
-							relayPrompt := fmt.Sprintf("[Актуальные проверенные данные из интернета по запросу %q]:\n%s\n\nИспользуй эти факты и кратко озвучь ответ пользователю на его вопрос.", query, results)
+							relayPrompt := fmt.Sprintf("Срочно озвучь пользователю точный ответ на его вопрос %q, используя эти проверенные факты:\n%s", query, results)
 							if p.audio != nil {
 								p.audio.flushPlayback()
 							}
