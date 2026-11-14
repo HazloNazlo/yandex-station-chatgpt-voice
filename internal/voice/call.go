@@ -423,13 +423,14 @@ func (p *peer) handleMessage(data []byte) {
 					p.report.Printf("User speech recognized: %q", fullText)
 					p.lastActivity.Store(time.Now().Unix())
 
-					// 1. Hangup check: "пока", "до свидания", "отбой", "стоп", "хватит", "заверши сессию"
+					// 1. Hangup check: "пока", "до свидания", "отбой", "стоп", "хватит", "заверши сессию", "заверши сеанс"
 					if isHangup, farewellMsg := parseHangupCommand(fullText); isHangup {
 						p.report.Printf("Hangup command triggered by speech: %q", fullText)
+						if p.audio != nil {
+							p.audio.mutePlayback(true)
+							p.audio.flushPlayback()
+						}
 						p.wg.Go(func() {
-							if p.audio != nil {
-								p.audio.mutePlayback(true)
-							}
 							if farewellMsg != "" {
 								playCtx, playCancel := context.WithTimeout(p.ctx, 4*time.Second)
 								_ = playSpeech(playCtx, farewellMsg)
@@ -444,27 +445,28 @@ func (p *peer) handleMessage(data []byte) {
 					// 2. Voice change check: "смени голос", "поставь женский голос", "какие есть голоса"
 					if isVoiceCmd, newVoice, msg := parseVoiceCommand(fullText); isVoiceCmd {
 						p.report.Printf("Voice command triggered: %q -> %s", fullText, newVoice)
+						if p.audio != nil {
+							p.audio.mutePlayback(true)
+							p.audio.flushPlayback()
+						}
 						p.wg.Go(func() {
 							if newVoice != "" {
 								if err := saveVoice(newVoice); err == nil {
 									p.report.Printf("Saved new voice preference: %s", newVoice)
 								}
 							}
-							if p.audio != nil {
-								p.audio.mutePlayback(true)
-							}
 							if msg != "" {
 								playCtx, playCancel := context.WithTimeout(p.ctx, 15*time.Second)
 								_ = playSpeech(playCtx, msg)
 								playCancel()
 								p.lastActivity.Store(time.Now().Unix())
-								_ = p.sendRelayText(fmt.Sprintf("[Ответ пользователю озвучен]: %s", msg))
 							}
 							if newVoice != "" {
 								time.Sleep(300 * time.Millisecond)
 								p.cancel(errProtocolHangup)
 							} else {
 								if p.audio != nil {
+									time.Sleep(500 * time.Millisecond)
 									p.audio.mutePlayback(false)
 								}
 							}
@@ -491,19 +493,24 @@ func (p *peer) handleMessage(data []byte) {
 
 					// 4. Web search check
 					if needSearch, query := detectSearchQuery(fullText); needSearch {
+						// Immediately silence ChatGPT audio over WebRTC so user doesn't hear excuses
+						if p.audio != nil {
+							p.audio.mutePlayback(true)
+							p.audio.flushPlayback()
+						}
 						p.wg.Go(func() {
 							p.report.Printf("Web search triggered for: %q", query)
-							searchCtx, cancel := context.WithTimeout(p.ctx, 4*time.Second)
+							searchCtx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
 							defer cancel()
 							results, err := searchWeb(searchCtx, query)
 							if err != nil {
 								p.report.Printf("Search error: %v", err)
+								if p.audio != nil {
+									p.audio.mutePlayback(false)
+								}
 								return
 							}
 							p.report.Printf("Search completed: %s", results)
-							if p.audio != nil {
-								p.audio.mutePlayback(true)
-							}
 							playCtx, playCancel := context.WithTimeout(p.ctx, 20*time.Second)
 							if playErr := playSpeech(playCtx, results); playErr != nil {
 								p.report.Printf("playSpeech error: %v", playErr)
@@ -513,10 +520,9 @@ func (p *peer) handleMessage(data []byte) {
 							playCancel()
 							p.lastActivity.Store(time.Now().Unix())
 							if p.audio != nil {
-								time.Sleep(300 * time.Millisecond)
+								time.Sleep(500 * time.Millisecond)
 								p.audio.mutePlayback(false)
 							}
-							_ = p.sendRelayText(fmt.Sprintf("[Ответ пользователю уже озвучен]: %s", results))
 						})
 					}
 				}

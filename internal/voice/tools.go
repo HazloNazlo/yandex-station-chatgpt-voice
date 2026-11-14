@@ -362,38 +362,52 @@ func handleSetVoice(argsJSON string) (string, error) {
 
 func parseHangupCommand(text string) (bool, string) {
 	lower := strings.ToLower(strings.TrimSpace(text))
-	lower = strings.Trim(lower, ".!?,;:\")'\"")
 
 	// If empty or an explicit question, it's not a farewell
 	if lower == "" || strings.HasSuffix(text, "?") {
 		return false, ""
 	}
 
+	// Normalize punctuation, ellipses, stutters:
+	// e.g. "Завер... Заверши сеанс" -> "завер заверши сеанс"
+	cleaned := strings.Map(func(r rune) rune {
+		if unicode.IsPunct(r) || unicode.IsSymbol(r) {
+			return ' '
+		}
+		return r
+	}, lower)
+	normalized := strings.Join(strings.Fields(cleaned), " ")
+	if normalized == "" {
+		return false, ""
+	}
+
 	// 1. Explicit hangup / termination commands (exact phrases or prefixes)
 	explicitPhrases := []string{
-		"заверши сесси", "завершить сесси", "завершай сесси",
-		"заверши разговор", "завершить разговор", "завершай разговор",
-		"заверши звонок", "завершить звонок", "закончи разговор", "закончить разговор",
-		"закрой разговор", "закрой сесси", "отключи сесси", "останови сесси",
-		"останови разговор", "положи трубку", "конец связи", "прекрати разговор",
+		"заверши сеанс", "завершить сеанс", "завершай сеанс", "завершаем сеанс", "завершаю сеанс",
+		"заверши сесси", "завершить сесси", "завершай сесси", "завершаем сесси", "завершаю сесси",
+		"заверши разговор", "завершить разговор", "завершай разговор", "завершаем разговор", "завершаю разговор",
+		"заверши диалог", "завершить диалог", "завершай диалог", "завершаем диалог", "завершаю диалог",
+		"заверши звонок", "завершить звонок", "сбрось звонок", "сбрось вызов",
+		"закончи сеанс", "закончить сеанс", "заканчивай сеанс", "заканчиваем сеанс",
+		"закончи сесси", "закончить сесси", "заканчивай сесси", "заканчиваем сесси",
+		"закончи разговор", "закончить разговор", "заканчивай разговор", "заканчиваем разговор",
+		"закончи диалог", "закончить диалог", "заканчивай диалог", "заканчиваем диалог",
+		"закрой сеанс", "закрой сесси", "закрой разговор", "закрой диалог",
+		"отключи сеанс", "отключи сесси", "отключи разговор", "отключи диалог",
+		"останови сеанс", "останови сесси", "останови разговор", "останови диалог",
+		"положи трубку", "конец связи", "прекрати разговор",
+		"давай прощаться", "пора прощаться", "давай закончим", "давай заканчивать",
+		"давай завершим", "давай завершать", "давай отключайся", "давай выключайся",
 		"замолчи", "заткнись",
 	}
 	for _, phrase := range explicitPhrases {
-		if strings.Contains(lower, phrase) {
+		if strings.Contains(normalized, phrase) {
 			return true, "До связи!"
 		}
 	}
 
 	// Tokenize words
-	fields := strings.FieldsFunc(lower, func(r rune) bool {
-		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
-	})
-	var cleanWords []string
-	for _, f := range fields {
-		if f != "" {
-			cleanWords = append(cleanWords, f)
-		}
-	}
+	cleanWords := strings.Fields(normalized)
 	if len(cleanWords) == 0 {
 		return false, ""
 	}
@@ -415,20 +429,23 @@ func parseHangupCommand(text string) (bool, string) {
 	// 2. Strict single-word termination commands
 	if len(cleanWords) == 1 {
 		singleFarewells := map[string]bool{
-			"пока":      true,
-			"стоп":      true,
-			"хватит":    true,
-			"отбой":     true,
-			"отключись": true,
-			"выключись": true,
-			"прекрати":  true,
+			"пока":       true,
+			"стоп":       true,
+			"хватит":     true,
+			"отбой":      true,
+			"отключись":  true,
+			"выключись":  true,
+			"отключайся": true,
+			"выключайся": true,
+			"закройся":   true,
+			"заканчивай": true,
+			"завершай":   true,
+			"прекрати":   true,
 		}
 		if singleFarewells[cleanWords[0]] {
 			return true, "До связи!"
 		}
 	}
-
-	fullClean := strings.Join(cleanWords, " ")
 
 	// 3. Multi-word exact farewell phrases
 	multiFarewells := []string{
@@ -436,9 +453,10 @@ func parseHangupCommand(text string) (bool, string) {
 		"ладно пока", "давай пока", "все пока", "всё пока", "ну все пока", "ну всё пока",
 		"все хватит", "всё хватит", "стоп игра", "все стоп", "всё стоп",
 		"спокойной ночи", "хорошо пока", "пока друг", "пока колонка",
+		"всего хорошего", "всего доброго", "пока алиса", "пока gpt", "пока чатгпт",
 	}
 	for _, mf := range multiFarewells {
-		if fullClean == mf {
+		if normalized == mf {
 			return true, "До связи!"
 		}
 	}
@@ -773,6 +791,11 @@ func fetchCryptoPrice(ctx context.Context, symbol string) (string, error) {
 }
 
 func formatWeatherSpeech(city, raw string) string {
+	if raw == "" || strings.Contains(raw, "location not found") || strings.Contains(raw, "upstream error") ||
+		strings.Contains(raw, "Unknown location") || strings.Contains(raw, "<html>") {
+		return ""
+	}
+
 	cityName := "вашем городе"
 	if city != "" {
 		cityName = "городе " + strings.Title(city)
@@ -841,7 +864,7 @@ func formatWeatherSpeech(city, raw string) string {
 	if tempStr != "" {
 		return fmt.Sprintf("Сейчас в %s %s%s%s.", cityName, cond, tempStr, windStr)
 	}
-	return fmt.Sprintf("Погода в %s: %s.", cityName, raw)
+	return ""
 }
 
 func wmoCodeToString(code int) string {
@@ -1006,13 +1029,142 @@ func fetchOpenMeteoWeather(ctx context.Context, city string, query string) (stri
 	return fmt.Sprintf("Сейчас в городе %s %s, %s, ветер %d %s в секунду.", cityName, desc, temp, wind, meterStr(wind)), nil
 }
 
-func fetchWeather(ctx context.Context, query string) (string, error) {
-	city := ""
-	lower := strings.ToLower(query)
-	reCity := regexp.MustCompile(`(?:в|во|для|город[ае]?)\s+([а-яёa-z-]+(?:\s+[а-яёa-z-]+)?)`)
-	if m := reCity.FindStringSubmatch(lower); len(m) > 1 {
-		city = m[1]
+var russianCityNominative = map[string]string{
+	"москве": "Москва", "москва": "Москва",
+	"калуге": "Калуга", "калуга": "Калуга",
+	"питере": "Санкт-Петербург", "петербурге": "Санкт-Петербург", "санкт-петербурге": "Санкт-Петербург", "спб": "Санкт-Петербург", "санкт петербурге": "Санкт-Петербург",
+	"самаре": "Самара", "самара": "Самара",
+	"казани": "Казань", "казань": "Казань",
+	"уфе": "Уфа", "уфа": "Уфа",
+	"туле": "Тула", "тула": "Тула",
+	"твери": "Тверь", "тверь": "Тверь",
+	"перми": "Пермь", "пермь": "Пермь",
+	"сочи": "Сочи",
+	"краснодаре": "Краснодар", "краснодар": "Краснодар",
+	"ростове": "Ростов-на-Дону", "ростов": "Ростов-на-Дону", "ростове на дону": "Ростов-на-Дону",
+	"воронеже": "Воронеж", "воронеж": "Воронеж",
+	"екатеринбурге": "Екатеринбург", "екатеринбург": "Екатеринбург",
+	"новосибирске": "Новосибирск", "новосибирск": "Новосибирск",
+	"челябинске": "Челябинск", "челябинск": "Челябинск",
+	"омске": "Омск", "омск": "Омск",
+	"красноярске": "Красноярск", "красноярск": "Красноярск",
+	"волгограде": "Волгоград", "волгоград": "Волгоград",
+	"саратове": "Саратов", "саратов": "Саратов",
+	"тюмени": "Тюмень", "тюмень": "Тюмень",
+	"тольятти": "Тольятти",
+	"ижевске": "Ижевск", "ижевск": "Ижевск",
+	"барнауле": "Барнаул", "барнаул": "Барнаул",
+	"иркутске": "Иркутск", "иркутск": "Иркутск",
+	"ульяновске": "Ульяновск", "ульяновск": "Ульяновск",
+	"хабаровске": "Хабаровск", "хабаровск": "Хабаровск",
+	"владивостоке": "Владивосток", "владивосток": "Владивосток",
+	"ярославле": "Ярославль", "ярославль": "Ярославль",
+	"томске": "Томск", "томск": "Томск",
+	"оренбурге": "Оренбург", "оренбург": "Оренбург",
+	"рязани": "Рязань", "рязань": "Рязань",
+	"астрахани": "Астрахань", "астрахань": "Астрахань",
+	"пензе": "Пенза", "пенза": "Пенза",
+	"липецке": "Липецк", "липецк": "Липецк",
+	"кирове": "Киров", "киров": "Киров",
+	"чебоксарах": "Чебоксары", "чебоксары": "Чебоксары",
+	"калининграде": "Калининград", "калининград": "Калининград",
+	"курске": "Курск", "курск": "Курск",
+	"брянске": "Брянск", "брянск": "Брянск",
+	"орле": "Орёл", "орел": "Орёл",
+	"белгороде": "Белгород", "белгород": "Белгород",
+	"владимире": "Владимир", "владимир": "Владимир",
+	"смоленске": "Смоленск", "смоленск": "Смоленск",
+	"иванове": "Иваново", "иваново": "Иваново",
+	"нижнем новгороде": "Нижний Новгород",
+	"великом новгороде": "Великий Новгород",
+}
+
+func isWeatherStopword(w string) bool {
+	stopwords := map[string]bool{
+		"сейчас": true, "сегодня": true, "завтра": true, "послезавтра": true,
+		"утром": true, "вечером": true, "днем": true, "ночью": true,
+		"на": true, "в": true, "во": true, "для": true, "пожалуйста": true,
+		"мне": true, "нам": true, "подскажи": true, "скажи": true, "будет": true,
+		"ожидается": true, "какая": true, "какой": true, "погода": true, "погоду": true,
+		"температура": true, "температуру": true, "градусов": true, "градус": true,
+		"неделе": true, "выходных": true, "там": true, "тут": true, "здесь": true,
 	}
+	return stopwords[w]
+}
+
+func extractCityFromWeather(query string) string {
+	lower := strings.ToLower(query)
+	cleaned := strings.Map(func(r rune) rune {
+		if unicode.IsPunct(r) || unicode.IsSymbol(r) {
+			return ' '
+		}
+		return r
+	}, lower)
+	words := strings.Fields(cleaned)
+
+	cityWords := []string{}
+	foundPrep := false
+	for _, w := range words {
+		if !foundPrep {
+			if w == "в" || w == "во" || w == "для" || w == "городе" || w == "город" {
+				foundPrep = true
+			}
+			continue
+		}
+		if isWeatherStopword(w) {
+			if len(cityWords) > 0 {
+				break
+			}
+			continue
+		}
+		cityWords = append(cityWords, w)
+		if len(cityWords) == 2 {
+			break
+		}
+	}
+
+	if len(cityWords) == 0 {
+		return ""
+	}
+	return strings.Join(cityWords, " ")
+}
+
+func normalizeCity(raw string) string {
+	raw = strings.ToLower(strings.TrimSpace(raw))
+	if raw == "" {
+		return "Москва"
+	}
+	if nom, ok := russianCityNominative[raw]; ok {
+		return nom
+	}
+	if strings.Contains(raw, "петербург") || strings.Contains(raw, "питер") {
+		return "Санкт-Петербург"
+	}
+	if strings.Contains(raw, "новгород") {
+		if strings.Contains(raw, "нижн") {
+			return "Нижний Новгород"
+		}
+		if strings.Contains(raw, "велик") {
+			return "Великий Новгород"
+		}
+	}
+	if strings.Contains(raw, "ростов") {
+		return "Ростов-на-Дону"
+	}
+	runes := []rune(raw)
+	if len(runes) > 3 && runes[len(runes)-1] == 'е' {
+		candidate := string(runes[:len(runes)-1]) + "а"
+		if nom, ok := russianCityNominative[candidate]; ok {
+			return nom
+		}
+		return strings.Title(candidate)
+	}
+	return strings.Title(raw)
+}
+
+func fetchWeather(ctx context.Context, query string) (string, error) {
+	rawCity := extractCityFromWeather(query)
+	city := normalizeCity(rawCity)
 
 	weatherMu.Lock()
 	cacheKey := city + "_" + query
@@ -1052,10 +1204,17 @@ func fetchWeather(ctx context.Context, query string) (string, error) {
 		return "", err
 	}
 	bodyStr := strings.TrimSpace(string(body))
-	if bodyStr == "" || strings.Contains(bodyStr, "Unknown location") {
+	if bodyStr == "" || strings.Contains(bodyStr, "Unknown location") || strings.Contains(bodyStr, "location not found") {
 		return "", errors.New("location not found")
 	}
-	result := formatWeatherSpeech(city, bodyStr)
+	displayCity := city
+	if rawCity == "" {
+		displayCity = ""
+	}
+	result := formatWeatherSpeech(displayCity, bodyStr)
+	if result == "" {
+		return "", errors.New("cannot format weather response")
+	}
 
 	weatherMu.Lock()
 	weatherCached[cacheKey] = result
@@ -1663,48 +1822,96 @@ func playSpeech(ctx context.Context, text string) error {
 }
 
 func splitIntoSentences(text string, maxLen int) []string {
-	if len(text) <= maxLen {
-		return []string{text}
+	trimmed := strings.TrimSpace(text)
+	if len([]rune(trimmed)) <= maxLen {
+		return []string{trimmed}
 	}
 	var res []string
-	parts := strings.SplitAfter(text, ". ")
+	parts := strings.SplitAfter(trimmed, ". ")
 	cur := ""
 	for _, p := range parts {
-		if len(cur)+len(p) <= maxLen {
-			cur += p
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if len([]rune(cur))+len([]rune(p))+2 <= maxLen {
+			if cur != "" {
+				cur += ". " + p
+			} else {
+				cur = p
+			}
 		} else {
 			if cur != "" {
-				res = append(res, strings.TrimSpace(cur))
+				res = append(res, cur)
 			}
-			cur = p
+			if len([]rune(p)) > maxLen {
+				subparts := strings.SplitAfter(p, ", ")
+				subCur := ""
+				for _, sp := range subparts {
+					sp = strings.TrimSpace(sp)
+					if sp == "" {
+						continue
+					}
+					if len([]rune(subCur))+len([]rune(sp))+2 <= maxLen {
+						if subCur != "" {
+							subCur += ", " + sp
+						} else {
+							subCur = sp
+						}
+					} else {
+						if subCur != "" {
+							res = append(res, subCur)
+						}
+						subCur = sp
+					}
+				}
+				cur = subCur
+			} else {
+				cur = p
+			}
 		}
 	}
 	if cur != "" {
-		res = append(res, strings.TrimSpace(cur))
+		res = append(res, cur)
 	}
 	return res
 }
 
 func playSpeechChunk(ctx context.Context, text string) error {
-	ttsURL := "https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=ru&q=" + url.QueryEscape(text)
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ttsURL, nil)
-	if err != nil {
-		return err
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return nil
 	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
 
-	resp, err := sharedHTTPClient.Do(req)
-	if err != nil {
-		return err
+	ttsURLs := []string{
+		"https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=ru&q=" + url.QueryEscape(trimmed),
+		"https://translate.google.com/translate_tts?ie=UTF-8&client=gtx&tl=ru&q=" + url.QueryEscape(trimmed),
+	}
+
+	var resp *http.Response
+	var fetchErr error
+	for _, ttsURL := range ttsURLs {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ttsURL, nil)
+		if err != nil {
+			fetchErr = err
+			continue
+		}
+		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+		resp, fetchErr = sharedHTTPClient.Do(req)
+		if fetchErr == nil && resp.StatusCode == http.StatusOK {
+			break
+		}
+		if resp != nil {
+			resp.Body.Close()
+			resp = nil
+		}
+	}
+	if resp == nil {
+		return fmt.Errorf("TTS request failed: %w", fetchErr)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("TTS HTTP error: %d", resp.StatusCode)
-	}
-
-	mp3Data, err := io.ReadAll(resp.Body)
+	mp3Data, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
 	if err != nil {
 		return err
 	}
@@ -1726,6 +1933,7 @@ func playSpeechChunk(ctx context.Context, text string) error {
 	}
 
 	var pcm48k bytes.Buffer
+	pcm48k.Grow(len(pcmRaw) * ratio)
 	for i := 0; i+4 <= len(pcmRaw); i += 4 {
 		sample := pcmRaw[i : i+4]
 		for r := 0; r < ratio; r++ {

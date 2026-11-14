@@ -86,6 +86,14 @@ func newAudio(epoch *stationEpoch) *audio {
 }
 
 func (a *audio) finish(ctx context.Context) error {
+	if a == nil {
+		return nil
+	}
+	if a.muted.Load() {
+		a.flushPlayback()
+		a.ackDrain()
+		return nil
+	}
 	a.queueMu.Lock()
 	a.finishing.Store(true)
 	a.queueMu.Unlock()
@@ -161,11 +169,11 @@ func (a *audio) close() error {
 
 func (a *audio) callback(output, _ []byte, frames uint32) {
 	clear(output)
-	if !a.epoch.allowed() || a.muted.Load() {
+	if a.finishing.Load() && (a.muted.Load() || (a.currentAt >= a.current.used && len(a.playback) == 0)) {
+		a.ackDrain()
 		return
 	}
-	if a.finishing.Load() && a.currentAt >= a.current.used && len(a.playback) == 0 {
-		a.ackDrain()
+	if !a.epoch.allowed() || a.muted.Load() {
 		return
 	}
 	for i := range min(int(frames), len(output)/stereoFrameBytes) {

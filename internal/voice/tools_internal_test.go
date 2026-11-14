@@ -124,6 +124,15 @@ func TestParseHangupCommand(t *testing.T) {
 		{"замолчи", true},
 		{"заверши сессию", true},
 		{"завершить сессию", true},
+		{"заверши сеанс", true},
+		{"завершить сеанс", true},
+		{"завершай сеанс", true},
+		{"закончи сеанс", true},
+		{"закрой сеанс", true},
+		{"Завер... Заверши сеанс", true},
+		{"давай завершим", true},
+		{"закончи диалог", true},
+		{"заверши сеанс пожалуйста", true},
 		{"заверши разговор", true},
 		{"завершить звонок", true},
 		{"отключись", true},
@@ -236,13 +245,25 @@ func TestWeather(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	res, err := fetchWeather(ctx, "погода в Калуге")
-	if err != nil {
-		t.Fatalf("fetchWeather failed: %v", err)
+	testQueries := []struct {
+		query    string
+		wantWord string
+	}{
+		{"погода в Калуге", "Калуг"},
+		{"какая погода в Калуге сейчас", "Калуг"},
+		{"погода в Москве на завтра", "Москв"},
+		{"какая сейчас погода", "вашем городе"},
 	}
-	t.Logf("Weather Калуга: %s", res)
-	if !strings.Contains(res, "Калуг") {
-		t.Errorf("expected 'Калуг' in weather, got: %s", res)
+
+	for _, tc := range testQueries {
+		res, err := fetchWeather(ctx, tc.query)
+		if err != nil {
+			t.Fatalf("fetchWeather(%q) failed: %v", tc.query, err)
+		}
+		t.Logf("Weather %q: %s", tc.query, res)
+		if !strings.Contains(res, tc.wantWord) {
+			t.Errorf("expected %q in weather for %q, got: %s", tc.wantWord, tc.query, res)
+		}
 	}
 }
 
