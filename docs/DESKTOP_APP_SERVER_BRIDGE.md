@@ -52,6 +52,18 @@ Sources:
 
 **Important maturity boundary:** Codex App Server itself is an OpenAI-documented, open-source JSON-RPC server. The specific realtime voice extension and event names used by the bridge (--enable realtime_conversation, thread/realtime/start, handoff_request, etc.) are experimental/private and are not documented as a stable public voice API. The third-party SDK is a useful implementation reference, not an OpenAI-supported integration contract.
 
+## Verified on ChatGPT Free — 14 November 2026
+
+The owner tested the official Codex CLI and App Server locally on a Mac Mini using Codex CLI 0.169.0:
+
+- `codex login status` reported `Logged in using ChatGPT`.
+- A `codex exec --model gpt-6-luna --sandbox read-only` request returned the exact expected string `CODEX_FREE_OK`.
+- A local App Server stdio test initialized with `experimentalApi: true`, started an ephemeral read-only thread with `gpt-6-luna`, registered `diagnostic_ping`, received the model-selected `item/tool/call`, returned its JSON result, and printed `PASS: Codex App Server called diagnostic_ping and accepted its result.`
+
+This is confirmed account-level evidence that the tested Free account can use Codex CLI inference and App Server dynamic tools. It supersedes the earlier uncertainty about this specific non-voice App Server path. It does **not** prove that Realtime voice, WebRTC, or native realtime handoff is available on the account.
+
+The next controlled check is [FREE_PLAN_BRIDGE_TEST.md](FREE_PLAN_BRIDGE_TEST.md), Gate 4A: a WebSocket Realtime session with text-injected input, native handoff, the same `diagnostic_ping`, and `speak_to_user` via `thread/realtime/appendSpeech`. This isolates the Realtime entitlement and handoff path before browser media or Station hardware is involved. Only after that passes should the team test a real browser/WebRTC call, then adapt the Station Pion client.
+
 ## The three layers
 
 ### 1. GPT Live voice surface
