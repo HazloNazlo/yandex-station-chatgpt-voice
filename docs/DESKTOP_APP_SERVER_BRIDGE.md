@@ -129,3 +129,133 @@ References:
 - https://github.com/opencoredev/login-with-chatgpt/blob/main/docs/content/docs/concepts/how-it-works.mdx
 
 The selected execution model must be passed in the session request. Do not assume the same model slug as the current direct /wm voice backend will be accepted by Codex. A model catalog can include slugs unavailable to a particular account; a successful test inference is the entitlement check. The third-party bridge guide explicitly warns that delegated tool turns can fail with misleading entitlement errors if a default model is silently substituted.
+
+
+## Tool execution and confirmations
+
+The inspected SDK uses server-owned function schemas:
+
+- tools: name, description, and JSON input schema.
+- executeTool(context): receives callId, name, and parsed arguments.
+- confirmTool(context): optional handler called only after an authenticated confirmation route is used.
+
+Important behavior: when a tool returns pendingConfirmation, the bridge immediately returns a structured "pending" result to the model. This avoids leaving the JSON-RPC request open and freezing the realtime voice surface. The actual consequential operation waits for explicit app confirmation.
+
+For this Station project:
+
+- Searches, page reads, weather, and rates can be read-only and normally need no confirmation.
+- Device changes and other mutations should have explicit policy and idempotency.
+- A voice utterance such as "yes, send it" must not by itself approve a consequential action. The reference bridge expects an application-side confirmation. Mini 1 has no rich display; a future implementation would need a safe physical confirmation gesture or a companion phone/web UI.
+- Do not expose a generic shell tool, arbitrary browser automation, or unrestricted URL fetcher.
+- Keep volume and voice operations local to the Station. A VPS callback cannot run the Station's local shell scripts directly; it needs an authenticated, narrow device RPC if those controls are exposed through the app-server tool list.
+
+## Operational requirements
+
+The app-server bridge is a long-running service, not a good fit for request-isolated serverless or edge functions:
+
+- Node.js or Bun backend.
+- codex executable available on the VPS PATH and compatible with the realtime extension.
+- Process supervision for the Node service and all Codex child processes.
+- Persistent encrypted token/session storage and a stable server secret. Do not use an in-memory session store in production.
+- One active Live/app-server session per account in the reference implementation; default idle/session TTL is 30 minutes.
+- Sticky routing if more than one backend instance is deployed, because the child-process/session registry is process-local.
+- TLS for all Station-to-VPS control requests and a per-Station credential with rotation/revocation.
+- Rate limits and quotas per account/device.
+- Bounded event queues and HTTP request sizes.
+- Explicit close on Station disconnect, Alice takeover, timeout, sign-out, or server shutdown.
+
+The Codex app-server's ordinary documented stdio mode is JSONL over stdin/stdout. The reference bridge also starts it with the experimental realtime_conversation feature. The latter is the compatibility risk: it can change independently of the documented JSON-RPC surface.
+
+## Fit for the existing Mini 1 project
+
+| Concern | Direct /wm + local router | Desktop-style app-server bridge |
+|---|---|---|
+| Voice/audio client | Existing Go/Pion client | Reuse Go/Pion is plausible, but SDP handoff needs a PoC |
+| ChatGPT login | Existing browser web-session cookie | Separate ChatGPT-plan/Codex OAuth device login |
+| Tool selection | Local phrase rules | Native model handoff to server execution |
+| Tool schemas | Not arbitrary on direct /wm | App-owned dynamic schemas on server |
+| Tool execution | Mostly on Station | Mostly on VPS |
+| Internet search | Local DDG/Wikipedia implementation | Any server-defined search provider |
+| Open URL / weather | Need to build local handlers | Build tools on VPS, model can select them |
+| Runtime | Go daemon on Station | Go daemon + long-lived Node/Bun + Codex child |
+| Main risk | Heuristic coverage and brittle scraping | Experimental realtime extension + OAuth/session operations |
+
+### Recommended split of responsibilities
+
+- Station Mini 1: wakeword detection, native Alice priority, microphone, Opus/WebRTC, speaker, playback interruption, local volume, local voice preference, and device lifecycle.
+- VPS: device authentication, ChatGPT-plan OAuth session, Codex app-server child lifecycle, tool schemas, web search, URL extraction, weather, tool result normalization, confirmation state, rate limiting, and logs.
+- WebRTC media should stay peer-to-service. The VPS should handle signaling and tool control, not transcode or proxy audio, unless the PoC demonstrates that direct media cannot be established.
+
+## Proof-of-concept plan
+
+Do not rewrite the Go client first. Validate the unknown private realtime extension in isolation.
+
+### PoC 1 — SDK/browser
+
+1. Deploy a small long-lived Bun/Node service on a VPS.
+2. Install the MIT-licensed @opencoredev/loginwithchatgpt-core and @opencoredev/loginwithchatgpt-server packages.
+3. Sign in with ChatGPT using the device-code OAuth flow (same account as the Station's web session).
+4. Register only one harmless diagnostic_ping dynamic tool with a strict schema.
+5. Connect the reference browser helper connectChatGPTRealtimeAppServer().
+6. Ask for a task that should trigger a handoff; verify the handoff event, tool callback, tool result, and spoken response.
+7. Confirm that closing the call kills the Codex child and removes its temporary home.
+
+Pass condition: the signed-in account can complete one native realtime handoff and hear the tool result, without an OpenAI Developer API key.
+
+### PoC 2 — Native Station transport
+
+1. Keep the current Pion peer, Opus tracks, wakeword handling, and Alice gate unchanged.
+2. Add a feature-flagged signaling adapter that posts the Pion offer to a device-authenticated VPS route and receives the SDP answer.
+3. Subscribe to the NDJSON bridge event stream using the returned opaque session ID.
+4. Verify full-duplex audio and interruption on the actual Mini 1.
+5. Verify that a tool handoff does not stop or duplicate the voice media stream.
+6. Verify Alice takeover tears down both the Pion peer and server-side Codex process.
+
+Pass condition: Mini 1 can use the new bridge while the current /wm path remains available as a rollback mode.
+
+### PoC 3 — real read-only tools
+
+Add in this order:
+1. web_search(query, freshness?)
+2. open_url(url)
+3. get_weather(location, date_range?)
+
+Use mocked tests first, then live provider tests. Return source URLs and provider timestamps so the voice model can state where facts came from.
+
+### Go/no-go criteria
+
+Proceed beyond PoC only when all of these are true:
+
+- No Developer API key is needed; ChatGPT-plan OAuth authentication succeeds on the intended account.
+- The Codex execution model is available under that account, and usage is visible under its ChatGPT-plan allowance.
+- A native handoff occurs without transcript heuristics.
+- The same WebRTC audio path remains interruptible.
+- The Station can reliably start, stop, and cancel the remote session.
+- Alice retains priority and late tool results are discarded.
+- Tools are allowlisted and server-owned.
+- The SDK's experimental realtime event shapes remain reproducible across repeated runs and a pinned Codex version.
+
+## Current recommendation
+
+Treat this as a **separate, feature-flagged transport option**, not a change to the existing /wm implementation and not an assumption that ChatGPT web cookies can authorize Codex.
+
+It is more capable than the local phrase router and closely matches the desired "model decides when to use tools" experience. It also has higher operational and compatibility cost: a Node/Bun VPS, a separate ChatGPT-plan OAuth login, Codex child-process supervision, and reliance on an experimental realtime extension.
+
+For the first milestone, prove one harmless native handoff with diagnostic_ping. If that works on the account and model you plan to use, continue to web search, URL reading, and weather. If it fails due to entitlement or protocol changes, keep the local tool gateway plan as the stable fallback.
+
+## References
+
+### OpenAI documentation
+
+- Codex app-server JSON-RPC protocol: https://learn.chatgpt.com/docs/app-server
+- Sign in with ChatGPT: Codex app-server with ChatGPT-plan OAuth: https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server
+- Using Codex with your ChatGPT plan: https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan
+- ChatGPT Work and Codex usage: https://help.openai.com/en/articles/20001275-chatgpt-work-and-codex
+
+### Experimental implementation reference (not an OpenAI API contract)
+
+- SDK repository (MIT): https://github.com/opencoredev/login-with-chatgpt
+- Experimental realtime voice guide: https://loginwithchatgpt.dev/docs/guides/realtime-voice
+- Server handler options: https://loginwithchatgpt.dev/docs/reference/server
+- HTTP routes: https://loginwithchatgpt.dev/docs/reference/routes
+- Implementation of the app-server bridge: https://github.com/opencoredev/login-with-chatgpt/blob/main/packages/server/src/realtime-app-server.ts
