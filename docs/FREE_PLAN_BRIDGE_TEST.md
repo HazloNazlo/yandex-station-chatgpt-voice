@@ -67,7 +67,7 @@ Interpretation:
 - If it fails for installation, DNS, TLS, or network reasons, resolve that separately; it does not prove plan ineligibility.
 - If the CLI says the model is unavailable, do not randomly substitute a paid-tier model. Check the model picker in the Free desktop app and report the exact error.
 
-## Gate 3 — confirm App Server presence
+## Gate 3 — confirm App Server and its current realtime API
 
 Only do this if Gate 2 succeeded.
 
@@ -76,10 +76,22 @@ codex app-server --help
 codex features list
 ```
 
-The current CLI reference marks `codex app-server` Experimental. The third-party realtime implementation additionally expects the private `realtime_conversation` feature and methods such as `thread/realtime/start`. Their presence in a CLI build is not a guarantee that OpenAI has enabled the feature for this account.
+Interpret the feature output carefully:
 
-Do not enable undocumented flags or edit the user's normal Codex config yet. Capture the output and inspect whether `realtime_conversation` is listed.
+- The `realtime_conversation removed true` row is expected in the 0.169.0 line. In the Codex source, `Stage::Removed` means the feature flag is a compatibility no-op; the feature comment says TUI voice availability follows platform support. The final `true` is the flag's effective/default state, **not** proof that an external realtime integration is enabled.
+- Do not use `codex features enable realtime_conversation` as a fix. It is a removed compatibility flag.
+- The App Server protocol still contains `thread/realtime/start`, but it is an experimental API method. The client must send `initialize.capabilities.experimentalApi: true`; otherwise the server rejects the request with an experimental-capability error.
+- The App Server command itself is marked experimental and OpenAI says it is not supported for production workloads. Treat this as a local PoC only.
 
+References:
+- Feature lifecycle implementation: https://github.com/openai/codex/blob/rust-v0.169.0/codex-rs/features/src/lib.rs
+- Realtime App Server protocol: https://github.com/openai/codex/blob/rust-v0.169.0/codex-rs/app-server-protocol/src/protocol/common.rs
+- Realtime capability tests: https://github.com/openai/codex/blob/rust-v0.169.0/codex-rs/app-server/tests/suite/v2/experimental_api.rs
+- App Server command maturity: https://learn.chatgpt.com/docs/changelog?date=2026-09-03&index=2
+
+### Gate 3A — App Server dynamic-tool ping (not yet voice)
+
+The first App Server test should verify that Codex can register and call a server-owned dynamic tool. This is a separate check from the realtime voice handoff. Use the diagnostic script in the next section only after Gate 3 and the CLI inference gate succeed.
 ## Gate 4 — native handoff and diagnostic_ping
 
 This gate requires a separate local/temporary app-server harness using the pinned third-party reference implementation. It should be built only after Gates 1–3 pass. The harness will:
