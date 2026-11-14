@@ -91,7 +91,199 @@ References:
 
 ### Gate 3A — App Server dynamic-tool ping (not yet voice)
 
-The first App Server test should verify that Codex can register and call a server-owned dynamic tool. This is a separate check from the realtime voice handoff. Use the diagnostic script in the next section only after Gate 3 and the CLI inference gate succeed.
+The first App Server test should verify that Codex can register and call a server-owned dynamic tool. This is a separate check from the realtime voice handoff. The script below starts App Server on stdio, initializes it with `experimentalApi: true`, creates an ephemeral read-only thread, registers one harmless dynamic tool, starts a model turn, and answers the server's `item/tool/call` request.
+
+Save and run it directly from Terminal:
+
+```bash
+node <<'NODE'
+const { spawn } = require("node:child_process");
+const readline = require("node:readline");
+
+const child = spawn("codex", ["app-server", "--stdio"], {
+  stdio: ["pipe", "pipe", "inherit"],
+});
+const pending = new Map();
+let nextId = 1;
+let toolCalls = 0;
+let finishTurn;
+let failTurn;
+const turnDone = new Promise((resolve, reject) => {
+  finishTurn = resolve;
+  failTurn = reject;
+});
+let shuttingDown = false;
+
+function send(message) {
+  if (!child.stdin.writable) throw new Error("App Server stdin is closed");
+  child.stdin.write(JSON.stringify(message) + "\n");
+}
+
+function rpc(method, params, timeoutMs = 45000) {
+  const id = nextId++;
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error("Timed out waiting for " + method));
+    }, timeoutMs);
+    pending.set(id, {
+      resolve: (value) => { clearTimeout(timer); resolve(value); },
+      reject: (error) => { clearTimeout(timer); reject(error); },
+    });
+    send({ id, method, params });
+  });
+}
+
+const output = readline.createInterface({ input: child.stdout });
+output.on("line", (line) => {
+  let message;
+  try {
+    message = JSON.parse(line);
+  } catch {
+    console.error("Non-JSON App Server stdout line:", line.slice(0, 300));
+    return;
+  }
+
+  if (message.method === "item/tool/call") {
+    const params = message.params || {};
+    console.log("DYNAMIC_TOOL_REQUEST:", params.tool, JSON.stringify(params.arguments || {}));
+    if (params.tool !== "diagnostic_ping") {
+      send({
+        id: message.id,
+        result: {
+          contentItems: [{ type: "inputText", text: "Only diagnostic_ping is allowed in this test." }],
+          success: false,
+        },
+      });
+      return;
+    }
+
+    toolCalls += 1;
+    const suppliedMessage = params.arguments?.message || "(no message supplied)";
+    send({
+      id: message.id,
+      result: {
+        contentItems: [{
+          type: "inputText",
+          text: "DIAGNOSTIC_PING_OK: " + suppliedMessage,
+        }],
+        success: true,
+      },
+    });
+    console.log("DYNAMIC_TOOL_RESULT_SENT");
+    return;
+  }
+
+  if (message.method === "turn/completed") {
+    finishTurn(message.params || {});
+    return;
+  }
+  if (message.method === "turn/failed") {
+    failTurn(new Error("Codex turn failed: " + JSON.stringify(message.params || {})));
+    return;
+  }
+
+  if (message.id !== undefined && pending.has(message.id)) {
+    const waiter = pending.get(message.id);
+    pending.delete(message.id);
+    if (message.error) {
+      waiter.reject(new Error(message.error.message || JSON.stringify(message.error)));
+    } else {
+      waiter.resolve(message);
+    }
+    return;
+  }
+
+  if (message.method && message.id !== undefined) {
+    send({
+      id: message.id,
+      error: { code: -32601, message: "Unsupported request in diagnostic harness" },
+    });
+  }
+});
+
+child.once("error", (error) => failTurn(error));
+child.once("exit", (code, signal) => {
+  if (!shuttingDown && code !== 0) {
+    failTurn(new Error("App Server exited: code=" + code + " signal=" + signal));
+  }
+});
+
+async function main() {
+  try {
+    const initialized = await rpc("initialize", {
+      clientInfo: {
+        name: "codex-free-diagnostic-ping",
+        title: "Codex Free App Server diagnostic",
+        version: "0.1.0",
+      },
+      capabilities: { experimentalApi: true },
+    });
+    console.log("APP_SERVER_INITIALIZED:", initialized.result?.platformOs || "ok");
+    send({ method: "initialized", params: {} });
+
+    const threadResponse = await rpc("thread/start", {
+      cwd: process.cwd(),
+      model: "gpt-6-luna",
+      ephemeral: true,
+      approvalPolicy: "never",
+      sandbox: "read-only",
+      dynamicTools: [{
+        type: "function",
+        name: "diagnostic_ping",
+        description: "A harmless test tool. Call it when asked to run the diagnostic ping.",
+        inputSchema: {
+          type: "object",
+          properties: { message: { type: "string" } },
+          required: ["message"],
+          additionalProperties: false,
+        },
+      }],
+    });
+
+    const threadId = threadResponse.result?.thread?.id;
+    if (!threadId) throw new Error("thread/start returned no thread id");
+    console.log("EPHEMERAL_THREAD_STARTED");
+
+    const completion = turnDone;
+    await rpc("turn/start", {
+      threadId,
+      input: [{
+        type: "text",
+        text: "You must call diagnostic_ping exactly once with message 'ping from ChatGPT Free App Server'. After the tool returns, summarize its result in one short sentence.",
+        textElements: [],
+      }],
+    });
+    console.log("MODEL_TURN_STARTED");
+    await Promise.race([
+      completion,
+      new Promise((_, reject) => setTimeout(() => reject(new Error("Timed out waiting for turn/completed")), 90000)),
+    ]);
+
+    if (toolCalls !== 1) {
+      throw new Error("Expected one diagnostic_ping call, received " + toolCalls);
+    }
+    console.log("PASS: Codex App Server called diagnostic_ping and accepted its result.");
+  } finally {
+    shuttingDown = true;
+    for (const waiter of pending.values()) waiter.reject(new Error("Test finished"));
+    pending.clear();
+    child.stdin.end();
+    const killer = setTimeout(() => child.kill("SIGTERM"), 2000);
+    killer.unref();
+  }
+}
+
+main().catch((error) => {
+  console.error("FAIL:", error.message);
+  process.exitCode = 1;
+  shuttingDown = true;
+  child.kill("SIGTERM");
+});
+NODE
+```
+
+This test does **not** prove native GPT Live voice handoff. It verifies only App Server initialization, a Free-plan model turn, dynamic tool registration, a model-selected `diagnostic_ping` call, and the JSON result round-trip. It uses the existing local Codex login, does not read or print auth files, and uses no OpenAI Developer API key.
 ## Gate 4 — native handoff and diagnostic_ping
 
 This gate requires a separate local/temporary app-server harness using the pinned third-party reference implementation. It should be built only after Gates 1–3 pass. The harness will:
