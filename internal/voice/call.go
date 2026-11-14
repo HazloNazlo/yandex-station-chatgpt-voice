@@ -297,45 +297,6 @@ func (p *peer) sendRelayText(text string) error {
 	return p.sendText(string(outerBytes))
 }
 
-func (p *peer) sendRelaySystemText(text string) error {
-	msgID := strings.ToLower(uuid.New().String())
-	now := float64(time.Now().UnixNano()) / 1e9
-
-	innerMsg := map[string]any{
-		"type": "relay_message",
-		"payload": map[string]any{
-			"type": "relay_message",
-			"message": map[string]any{
-				"id":          msgID,
-				"author":      map[string]any{"role": "system"},
-				"create_time": now,
-				"content": map[string]any{
-					"content_type": "text",
-					"parts":        []string{text},
-				},
-				"clientMetadata": map[string]any{
-					"isOptimistic": true,
-				},
-			},
-		},
-	}
-	innerBytes, err := json.Marshal(innerMsg)
-	if err != nil {
-		return err
-	}
-
-	outerMsg := map[string]any{
-		"type": "data_message",
-		"data": string(innerBytes),
-	}
-	outerBytes, err := json.Marshal(outerMsg)
-	if err != nil {
-		return err
-	}
-
-	return p.sendText(string(outerBytes))
-}
-
 func (p *peer) handleMessage(data []byte) {
 	//nolint:errorlint // Only the exact sentinel is benign; wrapped or joined failures must remain failures.
 	if p.ctx.Err() != nil && context.Cause(p.ctx) != errProtocolHangup {
@@ -463,7 +424,7 @@ func (p *peer) handleMessage(data []byte) {
 								p.audio.flushPlayback()
 							}
 							if msg != "" {
-								_ = p.sendRelaySystemText("Произнеси для пользователя следующий текст: " + msg)
+								_ = p.sendRelayText(fmt.Sprintf("[Команда]: Скажи пользователю: %s", msg))
 							}
 							if newVoice != "" {
 								// Wait for confirmation to be spoken, then hang up to activate new voice on next session
@@ -886,20 +847,7 @@ func runCall(e *stationEpoch, sessionFile string, capture *stationCapture, setti
 		}
 	}
 	e.report.Printf("WebRTC DataChannel ready in %v (total setup: %v)", time.Since(waitStart), time.Since(callStart))
-	// 1. Send session.update with tools & instructions over DataChannel
-	if sessionUpdateErr := p.sendText(getSessionUpdateMessage()); sessionUpdateErr != nil {
-		p.report.Printf("Warning: cannot send session.update: %v", sessionUpdateErr)
-	} else {
-		p.report.Print("Delivered session.update with tools to ChatGPT.")
-	}
 
-	// 2. Programmatic Session Priming (Solution #2)
-	primingPrompt := "[Системные инструкции]: Ты голосовой ассистент ChatGPT Live на умной колонке Яндекс Станция. Твои ответы озвучиваются вслух через динамик: говори кратко (1-2 предложения), живым разговорным тоном, без лишних вступлений и списков. У тебя есть полноценный выход в интернет (DuckDuckGo, курсы валют ЦБ РФ, криптобиржи, прогноз погоды), управление громкостью динамика и сменяемые голоса. Никогда не говори «у меня нет доступа в интернет». Если пользователь говорит «пока», «отбой», «стоп», «хватит» — вежливо ответь «Пока!» и завершай звонок."
-	if primeErr := p.sendRelaySystemText(primingPrompt); primeErr != nil {
-		p.report.Printf("Warning: cannot send system priming: %v", primeErr)
-	} else {
-		p.report.Print("Delivered session priming prompt to ChatGPT.")
-	}
 	if ctx.Err() != nil {
 		return complete(context.Cause(ctx))
 	}
