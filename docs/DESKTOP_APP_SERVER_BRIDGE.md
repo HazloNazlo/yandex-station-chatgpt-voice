@@ -90,7 +90,7 @@ The existing Go Station client already creates a Pion WebRTC offer and processes
 6. When a tool finishes, the bridge speaks the result in the same Live conversation. No synthetic user-role relay_message is needed for the primary tool result path.
 7. If native Alice becomes active, the Station immediately closes its media session and calls the VPS teardown endpoint. The VPS cancels outstanding work and kills the child process.
 
-The official SDK's browser helper connectChatGPTRealtimeAppServer() is designed for a browser microphone and an application UI. The Station project should **not** try to run that browser helper on ARMv7. Instead, reuse the server-side session primitive / HTTP route design and adapt the existing Go Pion client. Whether the same SDP offer and data-channel settings work unchanged with this server path must be proven in a small PoC.
+The third-party SDK's browser helper connectChatGPTRealtimeAppServer() is designed for a browser microphone and an application UI. The Station project should **not** try to run that browser helper on ARMv7. Instead, reuse the server-side session primitive / HTTP route design and adapt the existing Go Pion client. Whether the same SDP offer and data-channel settings work unchanged with this server path must be proven in a small PoC.
 
 ### Suggested HTTP surface
 
