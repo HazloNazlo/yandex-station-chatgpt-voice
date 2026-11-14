@@ -11,32 +11,44 @@ It is **not** a way to add arbitrary tools to the Station project's existing dir
 Authentication also differs from the current Station browser-cookie login:
 
 - Current project: ChatGPT website session cookies are imported to the Station and refreshed to obtain a short-lived web Voice token for direct /realtime/wm.
-- App-server bridge: a ChatGPT-plan OAuth token is used by Codex App Server. A device-code / Sign in with ChatGPT flow can obtain it. The same ChatGPT account can be used, but the existing session.json browser cookie is not itself the Codex app-server credential.
+- The inspected third-party bridge SDK does **not** use the official Sign in with ChatGPT (SIWC) plan-sharing flow. Its source mirrors the public Codex CLI OAuth client ID and scopes (openid, profile, email, offline_access), then writes a Codex-compatible auth.json for the child process. Its default Codex endpoint is the private ChatGPT backend path. That is reverse-engineered client behavior, not a documented third-party authentication API.
+- The separate official SIWC open-source flow uses a different OAuth registration/scope set, including chatgpt.tokens.use.direct. Current OpenAI SIWC quickstart describes plan usage for eligible Plus and Pro users; the general other-apps help page describes Go, Plus, Pro, and Business eligibility for participating apps. Free is not listed as eligible for plan sharing to an external app.
+- The same ChatGPT account may still be able to use Codex Free in an OpenAI first-party surface, but that does not automatically entitle this third-party bridge to use the plan.
 
-This can avoid a Developer API key and API-project pay-as-you-go billing. OpenAI documents Codex App Server using an OAuth access token authorized by the user's ChatGPT plan. The underlying Codex provider sends inference requests to the Responses endpoint using that plan token; that is not the same thing as a developer API key. Work and Codex usage is subject to the user's ChatGPT plan allowances and credits:
-- https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server
-- https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan
-- https://help.openai.com/en/articles/20001275-chatgpt-work-and-codex
+This can avoid an OpenAI Developer API key, but it is **not yet established that the bridge is supported on Free**. Do not treat a successful browser sign-in or token exchange as proof of inference entitlement.
 
-### ChatGPT Free plan: does it work without an upgrade?
+### ChatGPT Free plan: what is actually included?
 
-As of 14 November 2026, OpenAI's current Help Center says Codex is included across ChatGPT plans, including **Free** and Go; usage limits vary by plan. The current pricing page lists Free at $0/month with limited Codex capability (GPT-6 Luna at Standard speed in the desktop app, subject to rollout). This is a material change from older Codex documentation that described paid-plan-only access.
+As of 14 November 2026:
 
-However, Free is not equivalent to Plus:
+- OpenAI says Codex is included across Free and Go, but Free's pricing description specifically lists GPT-6 Luna at Standard speed in the ChatGPT desktop app (subject to rollout).
+- The Plus plan explicitly lists Codex on the web, in the CLI, and in the IDE extension. The Free description does not list those CLI surfaces.
+- Codex Cloud is explicitly not included with Free or Go.
+- The documented Codex App Server is a CLI component, and the current CLI reference labels `codex app-server` Experimental. Therefore the official plan documentation does not establish that a Free account can run this server-side bridge.
+- The official SIWC route for an external open-source app is a separate mechanism and currently lists eligible Plus/Pro users for ChatGPT plan use. Do not use it as a claimed Free fallback.
+- The third-party SDK's reuse of the Codex CLI OAuth client ID may behave differently from SIWC, but it is reverse-engineered and not an officially supported entitlement bypass. Do not rely on it or design around it without a successful, policy-compliant test.
 
-- Codex Cloud is explicitly **not included** with Free or Go.
-- Free usage is limited; do not assume a large or continuous voice-assistant allowance.
-- The pricing page currently calls out GPT-6 Luna in the desktop app for Free, subject to rollout. It does not promise every Codex model, surface, or third-party app-server integration on every Free account.
-- The proposed bridge uses a self-hosted Codex app-server process on the VPS, not OpenAI-managed Codex Cloud. That is why it may be possible without a paid plan, but the exact App Server + Sign in with ChatGPT + experimental realtime handoff combination still needs an account-level PoC.
-- The Sign in with ChatGPT plan-usage preview is documented for open-source and locally hosted apps. OpenAI says paid or remotely hosted app offerings need to follow its access requirements and submit an interest form. A private VM used by the owner is not the same as selling a hosted service to other users, but the deployment and registration should be checked against the current self-hosted VM guidance.
+**Recommended first test on Free:** on the user's own Mac, install the official Codex CLI and try the normal ChatGPT sign-in. Check `codex login status`, then attempt one small read-only `codex exec` using the Free-listed model `gpt-6-luna`. If the account cannot run a CLI inference, stop: the App Server bridge is not a viable Free path under the documented surfaces. If it does work, then test `codex app-server` and the experimental realtime feature separately. Do not upgrade before these checks.
 
-Therefore: **do not upgrade just to start the PoC**. First try the account's Free entitlement using the official ChatGPT sign-in / plan-usage consent flow and a harmless test tool. The test passes only if the OAuth grant includes `chatgpt.tokens.use.direct`, the selected execution model completes a real inference, and the realtime bridge emits a native handoff. If any of those checks fail, diagnose the exact eligibility or rollout error before considering a paid plan.
+Example CLI gate (run locally, not on the Station):
+```bash
+npm install -g @openai/codex
+codex login
+codex login status
+codex exec --model gpt-6-luna --sandbox read-only --skip-git-repo-check \
+  "Reply with exactly CODEX_FREE_OK"
+```
+
+A successful CLI response only passes the model/plan gate. It does not prove that App Server, `realtime_conversation`, the third-party OAuth flow, or native realtime handoff is available.
 
 Sources:
-- Codex availability, including Free and Go; Cloud exclusion: https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan
-- Current Free plan capability: https://learn.chatgpt.com/docs/pricing
-- Sign in with ChatGPT scope, open-source / locally hosted app scope, and remote-hosted app requirements: https://developers.openai.com/siwc/token-sharing-open-source
-- App Server OAuth setup: https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server
+- Codex plan availability and limits: https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan
+- Current Free vs Plus surface descriptions: https://learn.chatgpt.com/docs/pricing
+- Codex CLI authentication: https://learn.chatgpt.com/docs/auth?surface=cli
+- App Server command maturity: https://learn.chatgpt.com/docs/cli/reference
+- SIWC open-source eligibility: https://developers.openai.com/siwc/quickstart
+- Third-party SDK Codex OAuth constants: https://github.com/opencoredev/login-with-chatgpt/blob/main/packages/core/src/constants.ts
+- Third-party App Server bridge source: https://github.com/opencoredev/login-with-chatgpt/blob/main/packages/server/src/realtime-app-server.ts
 
 **Important maturity boundary:** Codex App Server itself is an OpenAI-documented, open-source JSON-RPC server. The specific realtime voice extension and event names used by the bridge (--enable realtime_conversation, thread/realtime/start, handoff_request, etc.) are experimental/private and are not documented as a stable public voice API. The third-party SDK is a useful implementation reference, not an OpenAI-supported integration contract.
 
