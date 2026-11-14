@@ -39,7 +39,7 @@ codex exec --model gpt-6-luna --sandbox read-only --skip-git-repo-check \
   "Reply with exactly CODEX_FREE_OK"
 ```
 
-A successful CLI response only passes the model/plan gate. It does not prove that App Server, `realtime_conversation`, the third-party OAuth flow, or native realtime handoff is available.
+A successful CLI response only passes the model/plan gate. It does not prove that App Server, `realtime_conversation`, the third-party OAuth flow, or native realtime handoff is available. For the complete copy/paste checklist and stop conditions, see [FREE_PLAN_BRIDGE_TEST.md](FREE_PLAN_BRIDGE_TEST.md).
 
 Sources:
 - Codex plan availability and limits: https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan
