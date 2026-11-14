@@ -67,3 +67,65 @@ Suggested initial server tools:
 | set_station_voice | Authenticated RPC to the Station's Go process | Device mutation |
 
 The model can choose among these tools based on the task. The application's executeTool callback still validates every argument, applies timeouts, and controls the real side effect. A model-generated schema is not an authorization boundary.
+
+
+## Message and media flow
+
+The key architectural separation is:
+
+- WebRTC carries the actual two-way audio.
+- The app-server's JSON-RPC child process handles voice delegation and tool lifecycle.
+- The Node/Bun HTTP server exposes a user-scoped signaling endpoint and a separate event stream to the Station client.
+- Tool implementations run on the VPS (or another trusted backend), not in the Mini 1 process.
+
+### Expected Station integration
+
+The existing Go Station client already creates a Pion WebRTC offer and processes the SDP answer. The first integration spike should test whether it can keep that media path while replacing direct signaling:
+
+1. Mini 1 creates the normal local WebRTC SDP offer using the existing Pion peer.
+2. Instead of posting multipart SDP + session to https://chatgpt.com/realtime/wm, the Go client posts the SDP and selected voice/model to an authenticated VPS endpoint such as POST /station/realtime/app-server.
+3. The VPS starts the Codex app-server session, submits the offer to thread/realtime/start, and returns the answer SDP plus an opaque session ID.
+4. Mini 1 applies the SDP answer and streams audio as it does today. The VPS is the signaling/control host; it should not proxy the RTP audio unless testing proves this is required.
+5. In parallel, the Go client consumes a bounded, authenticated NDJSON event stream for session lifecycle and tool status. Tool execution itself remains on the VPS.
+6. When a tool finishes, the bridge speaks the result in the same Live conversation. No synthetic user-role relay_message is needed for the primary tool result path.
+7. If native Alice becomes active, the Station immediately closes its media session and calls the VPS teardown endpoint. The VPS cancels outstanding work and kills the child process.
+
+The official SDK's browser helper connectChatGPTRealtimeAppServer() is designed for a browser microphone and an application UI. The Station project should **not** try to run that browser helper on ARMv7. Instead, reuse the server-side session primitive / HTTP route design and adapt the existing Go Pion client. Whether the same SDP offer and data-channel settings work unchanged with this server path must be proven in a small PoC.
+
+### Suggested HTTP surface
+
+The SDK's built-in authenticated routes are:
+
+| Method | Route | Purpose |
+|---|---|---|
+| POST | /realtime/app-server | Start a Live + app-server session and exchange SDP |
+| GET | /realtime/app-server/:id/events | Stream NDJSON lifecycle / tool events |
+| POST | /realtime/app-server/:id/confirm | Resolve a pending application confirmation |
+| DELETE | /realtime/app-server/:id | Stop the Live session and child process |
+
+For the Station, put a narrow device-authenticated facade in front of these routes. The Station should authenticate as a paired device; the backend maps that device to the ChatGPT account and session. Do not copy the browser's HttpOnly login cookie or any ChatGPT refresh token onto the Station just to call these endpoints.
+
+The bridge emits events such as session.started, session.closed, handoff, tool.running, tool.completed, tool.pending_confirmation, tool.failed, and error. The bridge stream is separate from the native DataChannel event stream.
+
+## Authentication and billing: critical distinction
+
+The current Station project uses a browser-session cookie family and a short-lived token minted for the ChatGPT website Voice client. That credential is for the direct web Voice route.
+
+The app-server path uses Codex/ChatGPT-plan OAuth credentials. The referenced SDK's sign-in route is a device-code flow: the user authorizes a ChatGPT account on OpenAI's device verification page, and the backend stores the resulting OAuth session. The child process is then given a Codex-compatible auth file. Its inspected source writes:
+- auth_mode: chatgpt
+- a ChatGPT-plan access_token
+- account_id
+- optional id_token and refresh_token
+- OPENAI_API_KEY: null
+
+The source creates a private temporary HOME directory and writes auth.json with owner-only permissions. This is another credential family, not an import of the Station's existing __Secure-next-auth.session-token cookie.
+
+Official OpenAI documentation describes Codex app-server using an OAuth token authorized for ChatGPT plan usage. It states that the access token is sent to the Responses endpoint; token refresh is the application's responsibility. The ChatGPT account's Codex/Work allowances and credits apply. Do not describe this as "no network API at all"; accurately describe it as **no Developer API key / no API-project billing, using ChatGPT-plan OAuth**.
+
+References:
+- https://developers.openai.com/siwc/token-sharing-open-source/codex-app-server
+- https://help.openai.com/en/articles/11369540-using-codex-with-your-chatgpt-plan
+- https://help.openai.com/en/articles/20001275-chatgpt-work-and-codex
+- https://github.com/opencoredev/login-with-chatgpt/blob/main/docs/content/docs/concepts/how-it-works.mdx
+
+The selected execution model must be passed in the session request. Do not assume the same model slug as the current direct /wm voice backend will be accepted by Codex. A model catalog can include slugs unavailable to a particular account; a successful test inference is the entitlement check. The third-party bridge guide explicitly warns that delegated tool turns can fail with misleading entitlement errors if a default model is silently substituted.
