@@ -17,6 +17,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/hajimehoshi/go-mp3"
 )
 
 const neuralSpeechConfigPath = "/data/yandex-station-chatgpt-voice/neural-tts.json"
@@ -124,12 +126,53 @@ func newNativeNeuralSpeech() *neuralSpeech {
 	return &neuralSpeech{
 		config: neuralSpeechConfig{
 			Voice:          "ru-RU-SvetlanaNeural",
-			BargeInRMS:     300,
+			BargeInRMS:     1200,
 			WMStopSpeaking: true,
 			LogTranscripts: true,
 		},
 		client: newSecureHTTPClient(),
 	}
+}
+
+func synthesizeGoogleTTS(ctx context.Context, text string) ([]byte, error) {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return nil, errors.New("empty speech text")
+	}
+	ttsURL := "https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=ru&q=" + url.QueryEscape(trimmed)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ttsURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+	client := &http.Client{
+		Timeout: 4 * time.Second,
+		Transport: &http.Transport{
+			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		},
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("google tts HTTP %d", resp.StatusCode)
+	}
+	mp3Data, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if err != nil {
+		return nil, err
+	}
+	dec, err := mp3.NewDecoder(bytes.NewReader(mp3Data))
+	if err != nil {
+		return nil, err
+	}
+	inRate := dec.SampleRate()
+	pcmRaw, err := io.ReadAll(dec)
+	if err != nil {
+		return nil, err
+	}
+	return resampleTo48kStereo(pcmRaw, inRate), nil
 }
 
 // speak performs one request only. A failure after first PCM never restarts the
@@ -150,15 +193,18 @@ func (s *neuralSpeech) speak(parent context.Context, a *audio, generation uint64
 	defer cancel()
 	start := time.Now()
 
-	// Direct native Edge Neural TTS synthesis when no proxy URL is configured.
+	// Direct native fast TTS synthesis with Edge Neural fallback when no proxy URL is configured.
 	if s.config.URL == "" {
-		voice := s.config.Voice
-		if voice == "" {
-			voice = "ru-RU-SvetlanaNeural"
-		}
-		pcm, err := synthesizeEdgeTTSDirect(ctx, text, voice)
+		pcm, err := synthesizeGoogleTTS(ctx, text)
 		if err != nil {
-			return stats, fmt.Errorf("native edge tts failed: %w", err)
+			voice := s.config.Voice
+			if voice == "" {
+				voice = "ru-RU-SvetlanaNeural"
+			}
+			pcm, err = synthesizeEdgeTTSDirect(ctx, text, voice)
+		}
+		if err != nil {
+			return stats, fmt.Errorf("local tts failed: %w", err)
 		}
 		stats.FirstPCM = time.Since(start)
 		frameSize := samplesPerFrame * stereoFrameBytes

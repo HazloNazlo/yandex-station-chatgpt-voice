@@ -137,41 +137,36 @@ func synthesizeEdgeTTSDirect(ctx context.Context, text, voice string) ([]byte, e
 	}
 
 	srcSampleRate := dec.SampleRate() // 24000
-	monoPCM, err := io.ReadAll(dec)
+	pcm, err := io.ReadAll(dec)
 	if err != nil {
 		return nil, fmt.Errorf("mp3 pcm read error: %w", err)
 	}
 
 	// 5. Resample to 48000 Hz, stereo, 16-bit
-	return resampleTo48kStereo(monoPCM, srcSampleRate), nil
+	return resampleTo48kStereo(pcm, srcSampleRate), nil
 }
 
-func resampleTo48kStereo(monoPCM []byte, inRate int) []byte {
+func resampleTo48kStereo(stereoPCM []byte, inRate int) []byte {
 	if inRate <= 0 {
 		inRate = 24000
 	}
-	repeatRatio := 48000 / inRate
-	if repeatRatio < 1 {
-		repeatRatio = 1
+	if inRate == 48000 {
+		return stereoPCM
 	}
-
-	numSamples := len(monoPCM) / 2
-	out := make([]byte, numSamples*repeatRatio*4) // 4 bytes per stereo sample (2 bytes L, 2 bytes R)
-	outIdx := 0
-
-	for i := 0; i < numSamples; i++ {
-		sampleBytes := monoPCM[i*2 : i*2+2]
-		for r := 0; r < repeatRatio; r++ {
-			// Left channel
-			out[outIdx] = sampleBytes[0]
-			out[outIdx+1] = sampleBytes[1]
-			// Right channel
-			out[outIdx+2] = sampleBytes[0]
-			out[outIdx+3] = sampleBytes[1]
-			outIdx += 4
+	inFrames := len(stereoPCM) / 4
+	if inFrames == 0 {
+		return nil
+	}
+	outFrames := int(int64(inFrames) * 48000 / int64(inRate))
+	out := make([]byte, outFrames*4)
+	for j := 0; j < outFrames; j++ {
+		srcIdx := int(int64(j) * int64(inRate) / 48000)
+		if srcIdx >= inFrames {
+			srcIdx = inFrames - 1
 		}
+		copy(out[j*4:j*4+4], stereoPCM[srcIdx*4:srcIdx*4+4])
 	}
-	return out[:outIdx]
+	return out
 }
 
 func xmlEscape(s string) string {
