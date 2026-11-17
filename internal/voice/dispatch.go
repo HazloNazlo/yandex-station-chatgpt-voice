@@ -13,7 +13,7 @@ func (p *peer) attachAudio(a *audio, speech *neuralSpeech) {
 	if speech != nil {
 		vad := newCaptureVAD(speech.config.BargeInRMS)
 		a.inputGate = func(frame captureFrame) {
-			if vad.observe(frame.pcm) {
+			if a.isPlaying() && vad.observe(frame.pcm) {
 				p.beginUserInput()
 			}
 		}
@@ -189,6 +189,6 @@ func (p *peer) dispatchUserText(text string) {
 		return
 	}
 	if err := p.turns.allowRemote(turn); err != nil && !errors.Is(err, context.Canceled) {
-		p.fail(err)
+		p.report.Printf("allowRemote note turn=%d: %v", turn.id, err)
 	}
 }
