@@ -1,120 +1,63 @@
-# Архитектура GPT Live для Яндекс Станции
+# Station voice architecture
 
-В этом документе детально описано внутреннее устройство проекта, интеграция с прошивкой Яндекс Станции (Quasar), организация WebRTC-канала и механизм работы с интернетом и громкостью.
+The client keeps native Alice priority while using a personal ChatGPT web session for ordinary `/wm` voice conversation. Local tool answers use an explicitly configured neural TTS proxy; they are not relayed into the autonomous `/wm` answer. This does not preserve the selected ChatGPT voice for local answers.
+
+See the detailed [protocol and architecture review](<SEAMLESS_VOICE_REVIEW.md>), [ADB verification procedure](<ADB_NEURAL_TTS_VERIFICATION.md>), and [proxy setup](<../services/neural-tts/README.md>). Private protocol capabilities and hardware compatibility require evidence, not assumptions from a public Realtime API or a target compiler flag.
+
+## Audio and native ownership
 
 ```mermaid
 flowchart TD
-    subgraph Yandex Station Hardware
-        MIC["Массив микрофонов (ALSA)"]
-        SPK["Динамик колонки (ALSA)"]
-        VOL_SH["/system/vendor/quasar/set_volume.sh"]
-    end
-
-    subgraph Native Firmware (Quasar)
-        ALICE_SPOTTER["Споттер 'Алиса'"]
-        ALICE_CORE["Службы Алисы (Quasar)"]
-    end
-
-    subgraph GPT Live Client (Linux ARMv7)
-        YANDEX_SPOTTER["Споттер 'Яндекс' (libdecode.so)"]
-        WEBRTC["WebRTC Audio & DataChannel Engine (Pion)"]
-        AUDIO_BOOST["Аудио-нормализатор (+5 dB Gain Boost)"]
-        INTERCEPTOR["Анализатор речи пользователя (Intent Parser)"]
-        SEARCH_ENGINE["Локальный поисковый движок"]
-    end
-
-    subgraph External Internet Services
-        DDG["DuckDuckGo (HTML POST)"]
-        CBR["Центробанк РФ (Курсы валют)"]
-        BINANCE["Binance API (Криптовалюты)"]
-        WTTR["wttr.in (Погода)"]
-        WIKI["Wikipedia REST API"]
-    end
-
-    subgraph OpenAI Cloud
-        OPENAI_STT["OpenAI Speech-to-Text"]
-        GPT_CORE["ChatGPT Reasoning Core"]
-        OPENAI_TTS["OpenAI Voice Synthesis (Opus)"]
-    end
-
-    MIC -->|PCM 16kHz| YANDEX_SPOTTER
-    MIC -->|PCM 16kHz| ALICE_SPOTTER
-
-    ALICE_SPOTTER -->|"Слово 'Алиса'"| ALICE_CORE
-    ALICE_CORE --> SPK
-
-    YANDEX_SPOTTER -->|"Слово 'Яндекс'"| WEBRTC
-    WEBRTC <-->|"WebRTC RTP (Opus 24/48kHz)"| OPENAI_TTS
-    WEBRTC -->|"WebRTC DataChannel"| OPENAI_STT
-
-    OPENAI_STT -->|"chat_message_delta (текст речи)"| INTERCEPTOR
-
-    INTERCEPTOR -->|"Команда громкости ('тише' / 'громче')"| VOL_SH
-    VOL_SH --> SPK
-
-    INTERCEPTOR -->|"Поисковый запрос (новости / погода / курсы)"| SEARCH_ENGINE
-    SEARCH_ENGINE --> DDG
-    SEARCH_ENGINE --> CBR
-    SEARCH_ENGINE --> BINANCE
-    SEARCH_ENGINE --> WTTR
-    SEARCH_ENGINE --> WIKI
-
-    SEARCH_ENGINE -->|"relay_message (Актуальные факты)"| WEBRTC
-    WEBRTC -->|"data_message / relay_message"| GPT_CORE
-
-    OPENAI_TTS -->|"Голосовой ответ"| WEBRTC
-    WEBRTC --> AUDIO_BOOST
-    AUDIO_BOOST -->|PCM 48kHz| SPK
+    MIC[Microphones] --> VQE[Native Yandex VQE/AEC]
+    VQE --> CAP[Processed capture: 16 kHz mono]
+    CAP --> WAKE[Native Yandex wake admission]
+    ALICE[Native Alice state] --> EPOCH[Station epoch: Alice has priority]
+    EPOCH --> WAKE
+    CAP --> GATE[Early processed-PCM input gate]
+    GATE --> OPUS[Opus encode: RTP clock 48 kHz]
+    OPUS --> WM[ChatGPT private wm WebRTC]
+    WM --> TRANSCRIPT[Bounded transcript assembly]
+    WM --> REMOTE[Opus decode: remote PCM]
+    TRANSCRIPT --> TURNS[Turn context and playback generation]
+    TURNS --> REMOTE
+    TURNS --> TOOLS[Typed local data retrieval]
+    TOOLS --> PROXY[Home/VPS neural proxy]
+    PROXY --> LOCAL[Framed 48 kHz stereo s16le PCM]
+    REMOTE --> PLAY[One generation-tagged malgo playback queue]
+    LOCAL --> PLAY
+    EPOCH --> PLAY
+    PLAY --> SPK[ALSA default speaker]
 ```
 
----
+Capture is 320 samples/20 ms at 16 kHz mono; playback is 960 frames/20 ms at 48 kHz stereo. The 48 kHz Opus RTP clock must not be confused with microphone sample rate. Software playback gain is unity so native AEC does not have an unverified +5 dB/clipping change to compensate for.
 
-## 1. Сосуществование с Алисой (Dual Wake Word)
+The Station epoch revokes capture/playback and cancels the peer when native Alice takes priority. Only the device callback owns its partially consumed PCM block; new turn generations invalidate that block as well as the channel queue. Existing short wake/end cue subprocesses remain separate from the spoken-answer pipeline.
 
-На Станции работает нативный аудиодекодер Яндекса (`libdecode.so`).
-- В приложении «Дом с Алисой» имя колонки устанавливается в **«Алиса»**.
-- Штатные службы Quasar реагируют на слово «Алиса» и воспроизводят стандартные ответы, музыку Яндекса и умный дом.
-- Наш фоновый демон `client` загружает нативную библиотеку споттера с конфигурацией на слово **«Яндекс»**.
-- Когда произносится «Яндекс»:
-  1. Демон подаёт короткий звуковой сигнал готовности (880 Гц).
-  2. Временно перехватывает воспроизведение.
-  3. Инициирует WebRTC-сессию с голосовым шлюзом ChatGPT.
-  4. После завершения диалога (по паузе или фразе прощания) колонка подаёт низкий сигнал (440 Гц) и возвращается в режим ожидания споттера.
+## Turn classification and local speech
 
----
+1. An early processed-PCM RMS trigger holds remote playback before the corresponding microphone frame is encoded/sent. This gate is a calibratable energy detector, not guaranteed speech recognition.
+2. The completed user transcript selects an ordinary or local-tool turn. Transcript parsing is bounded and supports inspected repository shapes, not every possible future/interleaved protocol event.
+3. Ordinary turns release retained remote audio. A full pending buffer fails closed rather than losing the beginning of the answer.
+4. Local turns discard held remote audio and claim one playback generation. Retrieval, HTTP streaming, queued audio, and drain work belong to that turn context.
+5. The proxy streams Edge MP3 through off-device ffmpeg and returns length-prefixed PCM. The speaker performs no neural inference, MP3 decoding/resampling, or separate TTS `aplay` playback.
+6. The consumer requires the application success marker, clean HTTP EOF, and callback drain. Completion retires local ownership to **blocked**, never timer-unmuting the discarded remote answer.
+7. New input cancels old work and begins a new generation. Stale completion/cancellation and worker registration are serialized against current input and peer teardown.
 
-## 2. WebRTC Live Voice Engine
+Normal remote admission remains 12 full blocks/240 ms. Pending hold and its bounded release/continuation can use 50 full blocks/1 second until the backlog drains; local speech uses at most eight full blocks/160 ms with backpressure, not lossy overflow. Hardware/ALSA buffering adds an unmeasured acoustic tail.
 
-Связь с сервером OpenAI строится по протоколу **ChatGPT Web Voice** (`https://chatgpt.com/realtime/wm`):
-- **Signaling:** SDP Offer генерируется нативной Go-библиотекой `pion/webrtc/v4` и отправляется через HTTP POST с заголовками авторизации сессии (`Bearer <token>`, `Oai-Device-Id`).
-- **Audio Codec:** двусторонний поток сжатия **Opus** через статически скомпилированную библиотеку `libopus` (CGO).
-- **DataChannel:** служебный канал обмена JSON-событиями (`chat_message_delta`, `conversation_update`, `usage_update`).
-- **Gain Booster (+5 dB):** оригинальный звук моделей OpenAI в Web Voice звучит тише нативного синтеза Яндекса. Встроенный модуль цифровой обработки усиливает PCM сэмплы с мягким клиппингом (`math.MaxInt16`), обеспечивая сочный и разборчивый звук на динамике Станции.
+Remote RTP has no verified user-turn identifier. The client rejects packets/PCM it already buffered under old generations, but cannot perfectly attribute old server audio arriving after new input. For a strict session boundary use a validated server acknowledgement or close/recreate the connection. The optional observed private `stop_speaking` action is off by default and is not presented as a verified cancellation contract.
 
----
+## Tools and external services
 
-## 3. Механизм интернет-поиска и актуальных данных
+- CBR mirror: dated reference USD/EUR/CNY rates, normalized nominal and rounded cents; not bank buy/sell or stock prices.
+- Binance: BTC/ETH exact pair validation, positive finite quote, explicit USDT/venue/receipt-time labeling.
+- Open-Meteo: validated geocoding, current values and dated limited forecasts. Missing/null values are not zero. Current-only wttr fallback cannot substitute for a failed future-date forecast.
+- News/search: bounded snippets with a fact/date-verification warning. Freshness failures do not become Wikipedia results claimed as current news.
+- Page reading: existing SSRF protections remain. External content is data, not execution instructions.
+- Volume: existing native hardware helper and percent/relative commands; local acknowledgement uses the configured neural voice.
 
-Поскольку серверная голосовая модель OpenAI не имеет встроенного поиска по сайтам через Web Voice, задача поиска полностью решена на стороне Яндекс Станции:
+The [Go consumer](<../internal/voice/speech.go>) reads an optional private local configuration, independently authenticated from ChatGPT. The [proxy](<../services/neural-tts/README.md>) accepts only bounded plain text and Svetlana/Dmitry voices. It has bounded concurrency/deadlines/pipe processing, cancellation-safe process ownership, and a mandatory framed success marker. Edge is unofficial, without SLA, and does not provide Vale.
 
-1. **Захват полного контекста фразы:**
-   В отличие от базовых реализаций, наш клиент собирает все патчи `chat_message_delta` до конца хода пользователя, накапливая полное предложение (а не обрывок из первого слова).
-2. **Анализ намерения (Intent Parser):**
-   Регулярные выражения и ключевые слова мгновенно определяют категорию вопроса:
-   - *Курсы валют / акций:* запрос к официальному API Центробанка РФ ([cbr-xml-daily.ru](https://www.cbr-xml-daily.ru/)) и Binance (< 150 мс).
-   - *Погода:* парсинг города и запрос к `wttr.in` на русском языке.
-   - *Время / дата:* точное локальное московское время.
-   - *Свободный поиск / новости / факты:* прямой HTTP `POST` в поисковик **DuckDuckGo** с извлечением заголовков и сниппетов (с авто-фоллбэком на Wikipedia API).
-3. **Бесшовная доставка в контекст модели:**
-   Клиент оборачивает найденные факты в валидный протокольный пакет `relay_message` (`{"type": "data_message", "data": "..."}`) от имени пользователя.
-4. **Очистка буфера воспроизведения (`flushPlayback`):**
-   Если модель уже начала говорить заглушку («Сейчас проверю...»), аудио-буфер мгновенно сбрасывается, и модель плавно начинает озвучивать актуальный ответ с учётом найденных данных.
+## Native-voice upgrade path
 
----
-
-## 4. Нативное управление громкостью Станции
-
-Клиент управляет громкостью на уровне операционной системы Linux и железа колонки:
-- **Чтение:** чтение сохранённого значения из `/bkupgrade/data/quasar/last_user_volume` или опрос ALSA микшера (`amixer sget Master`).
-- **Установка:** запуск системного скрипта `/system/vendor/quasar/set_volume.sh <percent>` с окружением библиотек `LD_LIBRARY_PATH=/system/vendor/quasar/libs`.
-- **Шкала:** полная поддержка как процентов (0–100%), так и стандартной яндексовской шкалы от 1 до 10 («громкость 5» = 50%, «громкость 8» = 80%), а также относительных команд («потише» = -15%, «погромче» = +15%, «на максимум» = 100%, «без звука» = 0%).
+The strongest same-voice candidate is Codex app-server realtime with native handoff, `item/tool/call`, and `thread/realtime/appendSpeech`. That is a separate control/tool protocol while validated WebRTC media can remain Station-to-OpenAI. A Free-account non-voice diagnostic is not voice entitlement. The [review](<SEAMLESS_VOICE_REVIEW.md>) lists the exact inspected flow and promotion gates; no working Station native bridge is claimed in this delivery.

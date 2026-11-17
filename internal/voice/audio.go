@@ -26,7 +26,30 @@ import (
 )
 
 const playbackQueueFrames = 12
+
+// Hold at most one second of remote audio while the completed transcript is
+// classified. Ordinary RTP still uses the original 240 ms queue limit.
+const pendingPlaybackFrames = 50
+const localPlaybackFrames = 8
 const stereoFrameBytes = stereoChannels * pcmSampleBytes
+
+type playbackOwner uint64
+
+const (
+	playbackRemote playbackOwner = iota
+	playbackPending
+	playbackLocal
+	playbackBlocked
+)
+
+const playbackOwnerMask = uint64(3)
+
+func playbackState(generation uint64, owner playbackOwner) uint64 {
+	return generation<<2 | uint64(owner)
+}
+
+func playbackGeneration(state uint64) uint64  { return state >> 2 }
+func playbackMode(state uint64) playbackOwner { return playbackOwner(state & playbackOwnerMask) }
 
 const captureSampleRate = 16000
 const playbackSampleRate = 48000
@@ -52,34 +75,44 @@ type captureFrame struct {
 }
 
 type playbackBlock struct {
-	epoch uint64
-	used  int
-	pcm   [samplesPerFrame * 2]int16
+	epoch      uint64
+	generation uint64
+	owner      playbackOwner
+	used       int
+	pcm        [samplesPerFrame * 2]int16
+	// A marker acknowledges the preceding PCM on the next device callback.
+	done chan struct{}
 }
 
 type audio struct {
-	epoch         *stationEpoch
-	mu            sync.Mutex
-	native        *malgo.Device
-	nativeContext *malgo.AllocatedContext
-	playback      chan playbackBlock
-	playbackDrops atomic.Uint64
-	queueMu       sync.Mutex
-	finishing     atomic.Bool
-	drained       chan struct{}
-	ackDrain      func()
-	stopping      atomic.Bool
-	muted         atomic.Bool
-	current       playbackBlock
-	currentAt     int
-	lastAudioTime atomic.Int64
+	epoch            *stationEpoch
+	mu               sync.Mutex
+	native           *malgo.Device
+	nativeContext    *malgo.AllocatedContext
+	playback         chan playbackBlock
+	playbackDrops    atomic.Uint64
+	queueMu          sync.Mutex
+	remoteQueueLimit int
+	finishing        atomic.Bool
+	drained          chan struct{}
+	ackDrain         func()
+	stopping         atomic.Bool
+	playout          atomic.Uint64
+	pendingOverflow  atomic.Bool
+	space            chan struct{}
+	inputGate        func(captureFrame)
+	current          playbackBlock
+	currentAt        int
+	pendingDrain     chan struct{}
+	lastAudioTime    atomic.Int64
 }
 
 func newAudio(epoch *stationEpoch) *audio {
 	drained := make(chan struct{})
 	return &audio{
 		epoch:    epoch,
-		playback: make(chan playbackBlock, playbackQueueFrames),
+		playback: make(chan playbackBlock, pendingPlaybackFrames),
+		space:    make(chan struct{}, 1),
 		drained:  drained,
 		ackDrain: sync.OnceFunc(func() { close(drained) }),
 	}
@@ -89,7 +122,8 @@ func (a *audio) finish(ctx context.Context) error {
 	if a == nil {
 		return nil
 	}
-	if a.muted.Load() {
+	mode := playbackMode(a.playout.Load())
+	if mode == playbackBlocked || mode == playbackPending {
 		a.flushPlayback()
 		a.ackDrain()
 		return nil
@@ -167,25 +201,48 @@ func (a *audio) close() error {
 	return nil
 }
 
+// Only the device callback owns current/currentAt/pendingDrain. Producers
+// invalidate them by changing the atomic generation, never by touching them.
 func (a *audio) callback(output, _ []byte, frames uint32) {
 	clear(output)
-	if a.finishing.Load() && (a.muted.Load() || (a.currentAt >= a.current.used && len(a.playback) == 0)) {
+	if a.pendingDrain != nil {
+		close(a.pendingDrain)
+		a.pendingDrain = nil
+	}
+	state := a.playout.Load()
+	if !a.blockAllowed(a.current, state) {
+		a.current.used, a.currentAt = 0, 0
+	}
+	mode := playbackMode(state)
+	if a.finishing.Load() && (mode == playbackBlocked ||
+		(a.currentAt >= a.current.used && len(a.playback) == 0)) {
 		a.ackDrain()
 		return
 	}
-	if !a.epoch.allowed() || a.muted.Load() {
+	if !a.epoch.allowed() || mode == playbackPending || mode == playbackBlocked {
 		return
 	}
+	played := false
 	for i := range min(int(frames), len(output)/stereoFrameBytes) {
-		if !a.epoch.allowed() {
+		if !a.epoch.allowed() || a.playout.Load() != state {
 			clear(output)
 			return
 		}
 		for attempt := 0; a.currentAt >= a.current.used && attempt < cap(a.playback); attempt++ {
 			select {
 			case block := <-a.playback:
-				if block.epoch != a.epoch.number {
+				a.notifySpace()
+				if !a.blockAllowed(block, state) {
 					continue
+				}
+				if block.done != nil {
+					a.pendingDrain = block.done
+					if !a.epoch.allowed() || a.playout.Load() != state {
+						clear(output)
+					} else if played {
+						a.lastAudioTime.Store(time.Now().Unix())
+					}
+					return
 				}
 				a.current = block
 				a.currentAt = 0
@@ -200,11 +257,24 @@ func (a *audio) callback(output, _ []byte, frames uint32) {
 		binary.LittleEndian.PutUint16(output[i*4:], uint16(left))
 		binary.LittleEndian.PutUint16(output[i*4+2:], uint16(right))
 		a.currentAt++
+		played = true
+	}
+	if !a.epoch.allowed() || a.playout.Load() != state {
+		clear(output)
+	} else if played {
 		a.lastAudioTime.Store(time.Now().Unix())
 	}
-	if !a.epoch.allowed() {
-		clear(output)
-		return
+}
+
+func (a *audio) blockAllowed(block playbackBlock, state uint64) bool {
+	return block.epoch == a.epoch.number && block.generation == playbackGeneration(state) &&
+		block.owner == playbackMode(state)
+}
+
+func (a *audio) notifySpace() {
+	select {
+	case a.space <- struct{}{}:
+	default:
 	}
 }
 
@@ -239,6 +309,9 @@ func (a *audio) send(ctx context.Context, track *webrtc.TrackLocalStaticSample, 
 		}
 		expected = frame.sequence + 1
 		haveFrame = true
+		if a.inputGate != nil {
+			a.inputGate(frame)
+		}
 		n, encodeErr := encoder.Encode(frame.pcm[:], packet[:])
 		if encodeErr != nil {
 			return fmt.Errorf("%w: Opus capture encoding failed", errStationAudio)
@@ -258,17 +331,28 @@ func (a *audio) send(ctx context.Context, track *webrtc.TrackLocalStaticSample, 
 }
 
 func (a *audio) queueDecoded(pcm []int16) {
-	if a.muted.Load() {
-		return
-	}
+	a.queueRemote(pcm, playbackGeneration(a.playout.Load()))
+}
+
+func (a *audio) queueRemote(pcm []int16, generation uint64) {
 	a.queueMu.Lock()
 	defer a.queueMu.Unlock()
-	if !a.epoch.allowed() || a.finishing.Load() {
+	state := a.playout.Load()
+	mode := playbackMode(state)
+	if !a.epoch.allowed() || a.finishing.Load() || playbackGeneration(state) != generation ||
+		(mode != playbackRemote && mode != playbackPending) {
 		return
+	}
+	limit := max(playbackQueueFrames, a.remoteQueueLimit)
+	if mode == playbackPending {
+		limit = pendingPlaybackFrames
+	} else if len(a.playback) <= playbackQueueFrames {
+		// After the held prefix drains, restore ordinary RTP's short queue.
+		a.remoteQueueLimit, limit = playbackQueueFrames, playbackQueueFrames
 	}
 	for len(pcm) > 0 {
 		n := min(len(pcm), samplesPerFrame*stereoChannels)
-		block := playbackBlock{epoch: a.epoch.number, used: n / stereoChannels}
+		block := playbackBlock{epoch: a.epoch.number, generation: generation, owner: playbackRemote, used: n / stereoChannels}
 		for i, s := range pcm[:n] {
 			v := int32(float64(s) * playbackGain)
 			if v > math.MaxInt16 {
@@ -279,6 +363,13 @@ func (a *audio) queueDecoded(pcm []int16) {
 			block.pcm[i] = int16(v)
 		}
 		pcm = pcm[n:]
+		if len(a.playback) >= limit {
+			a.playbackDrops.Add(1)
+			if mode == playbackPending {
+				a.pendingOverflow.Store(true)
+			}
+			continue
+		}
 		select {
 		case a.playback <- block:
 		default:
@@ -287,33 +378,172 @@ func (a *audio) queueDecoded(pcm []int16) {
 	}
 }
 
-func (a *audio) flushPlayback() {
-	if a == nil {
-		return
-	}
+// beginPending invalidates both queued and callback-current samples before any
+// potentially blocking tool or network work starts.
+func (a *audio) beginPending() uint64 {
 	a.queueMu.Lock()
 	defer a.queueMu.Unlock()
+	generation := playbackGeneration(a.playout.Load()) + 1
+	a.playout.Store(playbackState(generation, playbackPending))
+	a.pendingOverflow.Store(false)
+	a.flushLocked()
+	return generation
+}
+
+func (a *audio) allowRemote(generation uint64) error {
+	a.queueMu.Lock()
+	defer a.queueMu.Unlock()
+	if !a.epoch.allowed() || a.playout.Load() != playbackState(generation, playbackPending) {
+		return context.Canceled
+	}
+	if a.pendingOverflow.Load() {
+		return errors.New("completed transcript exceeded bounded remote-audio hold buffer")
+	}
+	// Preserve continuation while a held prefix longer than the normal queue
+	// drains. Applying the 12-block limit immediately would discard new words.
+	a.remoteQueueLimit = min(pendingPlaybackFrames, max(playbackQueueFrames, len(a.playback)+playbackQueueFrames))
+	// The generation stays unchanged so buffered, unclassified remote PCM can
+	// play without dropping the beginning of an ordinary assistant answer.
+	a.playout.Store(playbackState(generation, playbackRemote))
+	return nil
+}
+
+func (a *audio) claimLocal(generation uint64) bool {
+	a.queueMu.Lock()
+	defer a.queueMu.Unlock()
+	if !a.epoch.allowed() || playbackGeneration(a.playout.Load()) != generation || a.finishing.Load() {
+		return false
+	}
+	a.playout.Store(playbackState(generation, playbackLocal))
+	a.flushLocked()
+	return true
+}
+
+func (a *audio) retireLocal(generation uint64) {
+	a.queueMu.Lock()
+	defer a.queueMu.Unlock()
+	if a.playout.Load() != playbackState(generation, playbackLocal) {
+		return
+	}
+	// No timer or completed TTS goroutine may reopen the discarded /wm answer.
+	// Only classification of a subsequent real user turn can allow remote PCM.
+	a.playout.Store(playbackState(generation, playbackBlocked))
+	a.flushLocked()
+}
+
+func (a *audio) enqueueLocal(ctx context.Context, generation uint64, block playbackBlock) error {
+	block.epoch, block.generation, block.owner = a.epoch.number, generation, playbackLocal
+	for {
+		if cause := context.Cause(ctx); cause != nil {
+			return cause
+		}
+		a.queueMu.Lock()
+		if !a.epoch.allowed() || a.finishing.Load() || a.playout.Load() != playbackState(generation, playbackLocal) {
+			a.queueMu.Unlock()
+			return context.Canceled
+		}
+		if len(a.playback) < localPlaybackFrames {
+			select {
+			case a.playback <- block:
+				a.queueMu.Unlock()
+				return nil
+			default:
+			}
+		}
+		a.queueMu.Unlock()
+		// Never hold queueMu while waiting: input interruption and Alice
+		// revocation must be able to invalidate a blocked writer immediately.
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-a.epoch.ctx.Done():
+			return context.Cause(a.epoch.ctx)
+		case <-a.space:
+		}
+	}
+}
+
+func (a *audio) queueLocalPCM(ctx context.Context, generation uint64, pcm []byte) error {
+	if len(pcm) == 0 || len(pcm) > samplesPerFrame*stereoFrameBytes || len(pcm)%stereoFrameBytes != 0 {
+		return errors.New("invalid 48 kHz stereo s16le speech frame")
+	}
+	block := playbackBlock{used: len(pcm) / stereoFrameBytes}
+	for i := range len(pcm) / pcmSampleBytes {
+		block.pcm[i] = int16(binary.LittleEndian.Uint16(pcm[i*pcmSampleBytes:]))
+	}
+	return a.enqueueLocal(ctx, generation, block)
+}
+
+func (a *audio) drainLocal(ctx context.Context, generation uint64) error {
+	done := make(chan struct{})
+	if err := a.enqueueLocal(ctx, generation, playbackBlock{done: done}); err != nil {
+		return err
+	}
+	timer := time.NewTimer(playbackDrainTimeout)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return context.Cause(ctx)
+		case <-a.epoch.ctx.Done():
+			return context.Cause(a.epoch.ctx)
+		case <-done:
+			return a.localPlaybackCause(ctx, generation)
+		case <-a.space:
+			if cause := a.localPlaybackCause(ctx, generation); cause != nil {
+				return cause
+			}
+		case <-timer.C:
+			if cause := a.localPlaybackCause(ctx, generation); cause != nil {
+				return cause
+			}
+			return fmt.Errorf("%w: local speech did not drain", errStationAudio)
+		}
+	}
+}
+
+func (a *audio) localPlaybackCause(ctx context.Context, generation uint64) error {
+	if cause := context.Cause(a.epoch.ctx); cause != nil {
+		return cause
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	if a.playout.Load() != playbackState(generation, playbackLocal) {
+		return context.Canceled
+	}
+	return nil
+}
+
+func (a *audio) flushLocked() {
+	a.remoteQueueLimit = playbackQueueFrames
 	for len(a.playback) > 0 {
 		select {
 		case <-a.playback:
 		default:
 		}
 	}
+	a.notifySpace()
 }
 
-func (a *audio) mutePlayback(mute bool) {
+func (a *audio) flushPlayback() {
 	if a == nil {
 		return
 	}
-	a.muted.Store(mute)
-	if mute {
-		a.flushPlayback()
-	}
+	a.queueMu.Lock()
+	defer a.queueMu.Unlock()
+	state := a.playout.Load()
+	a.playout.Store(playbackState(playbackGeneration(state)+1, playbackMode(state)))
+	a.flushLocked()
 }
 
 func (a *audio) isPlaying() bool {
 	if a == nil {
 		return false
+	}
+	mode := playbackMode(a.playout.Load())
+	if mode != playbackRemote && mode != playbackLocal {
+		return false // Held or discarded media is not audible activity.
 	}
 	return time.Now().Unix()-a.lastAudioTime.Load() < 2 || len(a.playback) > 0
 }
@@ -398,6 +628,7 @@ func (a *audio) receive(ctx context.Context, track *webrtc.TrackRemote) (result 
 	var nextTimestamp uint32
 	havePacket := false
 	arrivals := make(map[uint16]time.Time)
+	bufferGeneration := playbackGeneration(a.playout.Load())
 	buffer := samplebuilder.New(uint16(reorderDelay/frameDuration), &paddingOpusDepacketizer{}, playbackSampleRate,
 		samplebuilder.WithMaxTimeDelay(reorderDelay),
 		samplebuilder.WithPacketReleaseHandler(func(packet *rtp.Packet) {
@@ -419,7 +650,7 @@ func (a *audio) receive(ctx context.Context, track *webrtc.TrackRemote) (result 
 							//nolint:staticcheck // Station and Opus are proper names in established user-visible diagnostics.
 							return errors.New("Opus loss concealment failed")
 						}
-						a.queueDecoded(pcm[:samplesPerFrame*2])
+						a.queueRemote(pcm[:samplesPerFrame*2], bufferGeneration)
 					}
 				} else if gap != 0 {
 					decoder, err = opus.NewDecoder(playbackSampleRate, stereoChannels)
@@ -434,8 +665,7 @@ func (a *audio) receive(ctx context.Context, track *webrtc.TrackRemote) (result 
 			}
 			nextTimestamp = sample.PacketTimestamp + uint32(n)
 			havePacket = true
-			a.lastAudioTime.Store(time.Now().Unix())
-			a.queueDecoded(pcm[:n*2])
+			a.queueRemote(pcm[:n*2], bufferGeneration)
 		}
 		return nil
 	}
@@ -477,6 +707,15 @@ func (a *audio) receive(ctx context.Context, track *webrtc.TrackRemote) (result 
 				continue
 			}
 			return errors.New("remote audio stream ended")
+		}
+		if generation := playbackGeneration(a.playout.Load()); generation != bufferGeneration {
+			// Do not relabel RTP already buffered before an interruption as the
+			// new turn. Continue decoding for Opus history, but drop its PCM.
+			buffer.Flush()
+			if drainErr := drain(); drainErr != nil {
+				return drainErr
+			}
+			bufferGeneration = generation
 		}
 		if haveReleased && int16(packet.SequenceNumber-lastReleased) <= 0 {
 			continue

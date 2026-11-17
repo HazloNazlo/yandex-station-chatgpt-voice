@@ -4,8 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
-	"encoding/json/jsontext"
-	"encoding/json/v2"
 	"errors"
 	"fmt"
 	"io"
@@ -17,7 +15,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"uuid"
 
 	"github.com/pion/logging"
 	"github.com/pion/sctp"
@@ -36,29 +33,27 @@ var errRemoteClosed = errors.New("remote voice connection closed")
 var errProtocolHangup = errors.New("voice protocol hangup")
 
 type peer struct {
-	pc        *webrtc.PeerConnection
-	dc        *webrtc.DataChannel
-	dcMu      sync.Mutex
-	mic       *webrtc.TrackLocalStaticSample
-	ctx       context.Context
-	cancel    context.CancelCauseFunc
-	ready     chan struct{}
-	tracks    chan *webrtc.TrackRemote
-	trackSeen atomic.Bool
-	wg        sync.WaitGroup
-	close     func() error
-	closing   atomic.Bool
-	report    *log.Logger
-	failureMu sync.Mutex
-	failure   error
-	abort     context.CancelCauseFunc
-	callsMu      sync.Mutex
-	seenCalls    map[string]bool
-	audio        *audio
+	pc            *webrtc.PeerConnection
+	dc            *webrtc.DataChannel
+	dcMu          sync.Mutex
+	mic           *webrtc.TrackLocalStaticSample
+	ctx           context.Context
+	cancel        context.CancelCauseFunc
+	ready         chan struct{}
+	tracks        chan *webrtc.TrackRemote
+	trackSeen     atomic.Bool
+	wg            sync.WaitGroup
+	close         func() error
+	closing       atomic.Bool
+	report        *log.Logger
+	failureMu     sync.Mutex
+	failure       error
+	abort         context.CancelCauseFunc
+	audio         *audio
+	speech        *neuralSpeech
+	turns         *turnCoordinator
 	userMu        sync.Mutex
-	userTextBuf   strings.Builder
-	asstTextBuf   strings.Builder
-	isUserMsg     bool
+	transcript    userTranscript
 	lastActivity  atomic.Int64
 	hasUserSpoken atomic.Bool
 }
@@ -80,13 +75,12 @@ func newPeer(
 	api := webrtc.NewAPI(webrtc.WithSettingEngine(settings))
 	ctx, cancel := context.WithCancelCause(ctx)
 	p := &peer{
-		report:    report,
-		ctx:       ctx,
-		cancel:    cancel,
-		ready:     make(chan struct{}),
-		tracks:    make(chan *webrtc.TrackRemote, 1),
-		abort:     abort,
-		seenCalls: make(map[string]bool),
+		report: report,
+		ctx:    ctx,
+		cancel: cancel,
+		ready:  make(chan struct{}),
+		tracks: make(chan *webrtc.TrackRemote, 1),
+		abort:  abort,
 	}
 	var err error
 	p.pc, err = api.NewPeerConnection(
@@ -99,6 +93,9 @@ func newPeer(
 	p.close = sync.OnceValue(func() error {
 		p.closing.Store(true)
 		p.cancel(context.Canceled)
+		if p.turns != nil {
+			p.turns.close()
+		}
 		// Peer closure tears down SCTP before joining the DataChannel read loop.
 		pcErr := p.pc.GracefulClose()
 		p.wg.Wait()
@@ -255,375 +252,6 @@ func (p *peer) sendText(text string) error {
 	return p.dc.SendText(text)
 }
 
-func (p *peer) sendRelayText(text string) error {
-	msgID := strings.ToLower(uuid.New().String())
-	now := float64(time.Now().UnixNano()) / 1e9
-
-	innerMsg := map[string]any{
-		"type": "relay_message",
-		"payload": map[string]any{
-			"type": "relay_message",
-			"message": map[string]any{
-				"id":          msgID,
-				"author":      map[string]any{"role": "user"},
-				"create_time": now,
-				"content": map[string]any{
-					"content_type": "text",
-					"parts":        []string{text},
-				},
-				"metadata": map[string]any{
-					"serialization_metadata": map[string]any{
-						"custom_symbol_offsets": []any{},
-					},
-				},
-				"clientMetadata": map[string]any{
-					"isOptimistic": true,
-				},
-			},
-		},
-	}
-	innerBytes, err := json.Marshal(innerMsg)
-	if err != nil {
-		return err
-	}
-
-	outerMsg := map[string]any{
-		"type": "data_message",
-		"data": string(innerBytes),
-	}
-	outerBytes, err := json.Marshal(outerMsg)
-	if err != nil {
-		return err
-	}
-
-	return p.sendText(string(outerBytes))
-}
-
-func (p *peer) handleMessage(data []byte) {
-	p.lastActivity.Store(time.Now().Unix())
-	//nolint:errorlint // Only the exact sentinel is benign; wrapped or joined failures must remain failures.
-	if p.ctx.Err() != nil && context.Cause(p.ctx) != errProtocolHangup {
-		return
-	}
-
-	unwrapped, eventType := extractWirePayload(data)
-	if eventType != "" && eventType != "chat_message_delta" {
-		p.report.Printf("DC recv event [%s]: %s", eventType, string(unwrapped))
-	}
-
-	switch eventType {
-	case "chat_message_delta":
-		var cmd struct {
-			Delta struct {
-				C int            `json:"c"`
-				P string         `json:"p"`
-				O string         `json:"o"`
-				V jsontext.Value `json:"v"`
-			} `json:"delta"`
-		}
-		if json.Unmarshal(unwrapped, &cmd) == nil {
-			p.userMu.Lock()
-			finished := false
-
-			if cmd.Delta.O == "add" {
-				var addMsg struct {
-					Message struct {
-						ID     string `json:"id"`
-						Author struct {
-							Role string `json:"role"`
-						} `json:"author"`
-						Content struct {
-							Parts []struct {
-								Text string `json:"text"`
-							} `json:"parts"`
-						} `json:"content"`
-					} `json:"message"`
-				}
-				if json.Unmarshal(cmd.Delta.V, &addMsg) == nil {
-					if addMsg.Message.Author.Role == "user" {
-						p.isUserMsg = true
-						p.userTextBuf.Reset()
-						for _, pt := range addMsg.Message.Content.Parts {
-							p.userTextBuf.WriteString(pt.Text)
-						}
-					} else {
-						// Assistant message starting -> previous user turn has completed
-						if p.isUserMsg {
-							finished = true
-						}
-						p.asstTextBuf.Reset()
-						for _, pt := range addMsg.Message.Content.Parts {
-							p.asstTextBuf.WriteString(pt.Text)
-						}
-					}
-				}
-			}
-
-			// Handle patches array if present in cmd.Delta.V (whether cmd.Delta.O is "patch" or empty)
-			if len(cmd.Delta.V) > 0 && cmd.Delta.V[0] == '[' {
-				var patches []struct {
-					P string         `json:"p"`
-					O string         `json:"o"`
-					V jsontext.Value `json:"v"`
-				}
-				if json.Unmarshal(cmd.Delta.V, &patches) == nil {
-					for _, pt := range patches {
-						if pt.O == "append" && strings.HasPrefix(pt.P, "/message/content/parts/") {
-							var textPart string
-							if json.Unmarshal(pt.V, &textPart) == nil {
-								if p.isUserMsg {
-									p.userTextBuf.WriteString(textPart)
-								} else {
-									p.asstTextBuf.WriteString(textPart)
-								}
-							}
-						}
-						if pt.P == "/message/status" {
-							var status string
-							if json.Unmarshal(pt.V, &status) == nil && status == "finished_successfully" {
-								if p.isUserMsg {
-									finished = true
-								} else {
-									asstText := strings.TrimSpace(p.asstTextBuf.String())
-									if asstText != "" {
-										p.report.Printf("Assistant speech: %q", asstText)
-									}
-									p.asstTextBuf.Reset()
-								}
-							}
-						}
-					}
-				}
-			}
-
-			// Handle single patch status on cmd.Delta
-			if cmd.Delta.P == "/message/status" {
-				var val string
-				if json.Unmarshal(cmd.Delta.V, &val) == nil && val == "finished_successfully" {
-					if p.isUserMsg {
-						finished = true
-					} else {
-						asstText := strings.TrimSpace(p.asstTextBuf.String())
-						if asstText != "" {
-							p.report.Printf("Assistant speech: %q", asstText)
-						}
-						p.asstTextBuf.Reset()
-					}
-				}
-			}
-
-			if finished && p.isUserMsg {
-				fullText := strings.TrimSpace(p.userTextBuf.String())
-				p.userTextBuf.Reset()
-				p.isUserMsg = false
-				p.userMu.Unlock()
-
-				if fullText != "" {
-					p.hasUserSpoken.Store(true)
-					p.report.Printf("User speech recognized: %q", fullText)
-					p.lastActivity.Store(time.Now().Unix())
-
-					// 1. Hangup check: "пока", "до свидания", "отбой", "стоп", "хватит", "заверши сессию", "заверши сеанс"
-					if isHangup, farewellMsg := parseHangupCommand(fullText); isHangup {
-						p.report.Printf("Hangup command triggered by speech: %q", fullText)
-						if p.audio != nil {
-							p.audio.mutePlayback(true)
-							p.audio.flushPlayback()
-						}
-						p.wg.Go(func() {
-							if farewellMsg != "" {
-								playCtx, playCancel := context.WithTimeout(p.ctx, 4*time.Second)
-								_ = playSpeech(playCtx, farewellMsg)
-								playCancel()
-							}
-							time.Sleep(200 * time.Millisecond)
-							p.cancel(errProtocolHangup)
-						})
-						return
-					}
-
-					// 2. Voice change check: "смени голос", "поставь женский голос", "какие есть голоса"
-					if isVoiceCmd, newVoice, msg := parseVoiceCommand(fullText); isVoiceCmd {
-						p.report.Printf("Voice command triggered: %q -> %s", fullText, newVoice)
-						if p.audio != nil {
-							p.audio.mutePlayback(true)
-							p.audio.flushPlayback()
-						}
-						p.wg.Go(func() {
-							if newVoice != "" {
-								if err := saveVoice(newVoice); err == nil {
-									p.report.Printf("Saved new voice preference: %s", newVoice)
-								}
-							}
-							if msg != "" {
-								playCtx, playCancel := context.WithTimeout(p.ctx, 15*time.Second)
-								_ = playSpeech(playCtx, msg)
-								playCancel()
-								p.lastActivity.Store(time.Now().Unix())
-							}
-							if newVoice != "" {
-								time.Sleep(300 * time.Millisecond)
-								p.cancel(errProtocolHangup)
-							} else {
-								if p.audio != nil {
-									time.Sleep(500 * time.Millisecond)
-									p.audio.mutePlayback(false)
-								}
-							}
-						})
-						return
-					}
-
-					// 3. Volume command check
-					if isVol, newVol, delta := parseVolumeCommand(fullText); isVol {
-						if newVol >= 0 {
-							if actual, err := setStationVolume(newVol); err == nil {
-								p.report.Printf("Volume command executed: Station volume set to %d%%", actual)
-							} else {
-								p.report.Printf("Volume error: %v", err)
-							}
-						} else if delta != 0 {
-							if actual, err := adjustStationVolume(delta); err == nil {
-								p.report.Printf("Volume command executed: Station volume adjusted by %d to %d%%", delta, actual)
-							} else {
-								p.report.Printf("Volume error: %v", err)
-							}
-						}
-					}
-
-					// 4. Web search check
-					if needSearch, query := detectSearchQuery(fullText); needSearch {
-						// Immediately silence ChatGPT audio over WebRTC so user doesn't hear excuses
-						if p.audio != nil {
-							p.audio.mutePlayback(true)
-							p.audio.flushPlayback()
-						}
-						p.wg.Go(func() {
-							p.report.Printf("Web search triggered for: %q", query)
-							searchCtx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
-							defer cancel()
-							results, err := searchWeb(searchCtx, query)
-							if err != nil {
-								p.report.Printf("Search error: %v", err)
-								if p.audio != nil {
-									p.audio.mutePlayback(false)
-								}
-								return
-							}
-							p.report.Printf("Search completed: %s", results)
-							playCtx, playCancel := context.WithTimeout(p.ctx, 20*time.Second)
-							if playErr := playSpeech(playCtx, results); playErr != nil {
-								p.report.Printf("playSpeech error: %v", playErr)
-							} else {
-								p.report.Print("Spoken live answer played through speaker successfully.")
-							}
-							playCancel()
-							p.lastActivity.Store(time.Now().Unix())
-							if p.audio != nil {
-								time.Sleep(500 * time.Millisecond)
-								p.audio.mutePlayback(false)
-							}
-						})
-					}
-				}
-			} else {
-				p.userMu.Unlock()
-			}
-		}
-
-	case "input_audio_buffer.speech_started":
-		p.lastActivity.Store(time.Now().Unix())
-	}
-
-	calls := parseToolCalls(data)
-	for _, call := range calls {
-		p.callsMu.Lock()
-		alreadySeen := p.seenCalls[call.CallID]
-		if !alreadySeen {
-			p.seenCalls[call.CallID] = true
-		}
-		p.callsMu.Unlock()
-
-		if alreadySeen {
-			continue
-		}
-
-		callID := call.CallID
-		name := call.Name
-		args := call.Arguments
-
-		p.wg.Go(func() {
-			p.report.Printf("Executing tool %q (call_id: %s) with args: %s", name, callID, args)
-			var output string
-			var execErr error
-
-			switch name {
-			case "set_volume":
-				output, execErr = handleSetVolume(args)
-			case "set_voice":
-				output, execErr = handleSetVoice(args)
-				p.wg.Go(func() {
-					time.Sleep(2500 * time.Millisecond)
-					p.cancel(errProtocolHangup)
-				})
-			case "search_web":
-				searchCtx, searchCancel := context.WithTimeout(p.ctx, 8*time.Second)
-				defer searchCancel()
-				output, execErr = handleSearchWeb(searchCtx, args)
-			case "hang_up", "end_session":
-				output = `{"status":"hanging_up"}`
-				p.wg.Go(func() {
-					time.Sleep(1200 * time.Millisecond)
-					p.cancel(errProtocolHangup)
-				})
-			default:
-				output = fmt.Sprintf(`{"error": "unknown tool %s"}`, name)
-			}
-
-			if execErr != nil {
-				p.report.Printf("Tool %q error: %v", name, execErr)
-				output = fmt.Sprintf(`{"error": %q}`, execErr.Error())
-			} else {
-				p.report.Printf("Tool %q completed successfully: %s", name, output)
-			}
-
-			itemMsg := map[string]any{
-				"type": "conversation.item.create",
-				"item": map[string]any{
-					"type":    "function_call_output",
-					"call_id": callID,
-					"output":  output,
-				},
-			}
-			itemBytes, _ := json.Marshal(itemMsg)
-			if err := p.sendText(string(itemBytes)); err != nil {
-				p.report.Printf("Failed to send function_call_output: %v", err)
-				return
-			}
-
-			respMsg := map[string]any{
-				"type": "response.create",
-			}
-			respBytes, _ := json.Marshal(respMsg)
-			if err := p.sendText(string(respBytes)); err != nil {
-				p.report.Printf("Failed to send response.create: %v", err)
-				return
-			}
-			p.report.Printf("Triggered ChatGPT response after tool %q.", name)
-		})
-	}
-
-	ev, err := decodeEvent(data)
-	switch {
-	case err != nil:
-		p.fail(err)
-	case ev.err != nil:
-		p.fail(ev.err)
-	case ev.ended:
-		p.cancel(errProtocolHangup)
-	}
-}
-
 func (p *peer) offer(ctx context.Context) (string, error) {
 	if ctx.Err() != nil {
 		return "", context.Cause(ctx)
@@ -771,6 +399,9 @@ func runCall(e *stationEpoch, sessionFile string, capture *stationCapture, setti
 				return
 			}
 		}
+		if _, invalidConfig := errors.AsType[configError](result); invalidConfig {
+			return // Bad local speech configuration is not a transient voice attempt.
+		}
 		if !errors.Is(result, errStationAudio) {
 			result = voiceCallError{result}
 		}
@@ -786,6 +417,17 @@ func runCall(e *stationEpoch, sessionFile string, capture *stationCapture, setti
 	if err != nil {
 		return err
 	}
+	speech, err := loadNeuralSpeech(neuralSpeechConfigPath)
+	if err != nil {
+		return configError{err}
+	}
+	if speech == nil {
+		speech = newNativeNeuralSpeech()
+	}
+	if speech.client != nil {
+		defer speech.client.CloseIdleConnections()
+	}
+	e.report.Print("Native Edge Neural local speech enabled; processed-PCM turn gate active")
 	ctx := e.ctx
 	var workers sync.WaitGroup
 	callStart := time.Now()
@@ -804,6 +446,7 @@ func runCall(e *stationEpoch, sessionFile string, capture *stationCapture, setti
 	if err != nil {
 		return err
 	}
+	p.attachAudio(e.output, speech)
 	ctx = p.ctx
 	playbackOpened := false
 	complete := func(cause error) error {
@@ -898,7 +541,6 @@ func runCall(e *stationEpoch, sessionFile string, capture *stationCapture, setti
 	if setupCtx.Err() != nil {
 		return errors.New("voice setup ended before media became ready")
 	}
-	p.audio = e.output
 	if err = e.output.open(); err != nil {
 		return err
 	}

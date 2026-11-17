@@ -4,6 +4,8 @@ go 1.27.4
 
 require (
 	github.com/gen2brain/malgo v0.11.27
+	github.com/gorilla/websocket v1.5.3
+	github.com/hajimehoshi/go-mp3 v0.3.4
 	github.com/hraban/opus v0.0.0-20260708213942-bde8e4304501
 	github.com/pion/logging v0.2.4
 	github.com/pion/rtcp v1.2.20
@@ -17,7 +19,6 @@ require (
 
 require (
 	github.com/google/uuid v1.6.0 // indirect
-	github.com/hajimehoshi/go-mp3 v0.3.4 // indirect
 	github.com/pion/datachannel v1.6.4 // indirect
 	github.com/pion/dtls/v3 v3.1.15 // indirect
 	github.com/pion/ice/v4 v4.4.8 // indirect

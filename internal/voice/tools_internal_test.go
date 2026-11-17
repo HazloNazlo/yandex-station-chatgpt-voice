@@ -2,6 +2,7 @@ package voice
 
 import (
 	"context"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -180,6 +181,9 @@ func TestCleanSearchQuery(t *testing.T) {
 }
 
 func TestSearchWebLive(t *testing.T) {
+	if os.Getenv("VOICE_LIVE_TOOLS_TESTS") != "1" {
+		t.Skip("set VOICE_LIVE_TOOLS_TESTS=1 for external provider integration tests")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 
@@ -228,6 +232,9 @@ func TestOpenURL_SSRF(t *testing.T) {
 }
 
 func TestOpenURL_Public(t *testing.T) {
+	if os.Getenv("VOICE_LIVE_TOOLS_TESTS") != "1" {
+		t.Skip("set VOICE_LIVE_TOOLS_TESTS=1 for external provider integration tests")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -241,7 +248,27 @@ func TestOpenURL_Public(t *testing.T) {
 	}
 }
 
+func TestTavilySearch(t *testing.T) {
+	if os.Getenv("VOICE_LIVE_TOOLS_TESTS") != "1" {
+		t.Skip("set VOICE_LIVE_TOOLS_TESTS=1 for external provider integration tests")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	res, err := fetchTavilySearch(ctx, "Кто президент Франции?")
+	if err != nil {
+		t.Fatalf("fetchTavilySearch failed: %v", err)
+	}
+	t.Logf("Tavily search answer: %s", res)
+	if !strings.Contains(strings.ToLower(res), "макрон") {
+		t.Errorf("expected mention of Macron, got: %s", res)
+	}
+}
+
 func TestWeather(t *testing.T) {
+	if os.Getenv("VOICE_LIVE_TOOLS_TESTS") != "1" {
+		t.Skip("set VOICE_LIVE_TOOLS_TESTS=1 for external provider integration tests")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -252,7 +279,7 @@ func TestWeather(t *testing.T) {
 		{"погода в Калуге", "Калуг"},
 		{"какая погода в Калуге сейчас", "Калуг"},
 		{"погода в Москве на завтра", "Москв"},
-		{"какая сейчас погода", "вашем городе"},
+		{"какая сейчас погода", "Москв"},
 	}
 
 	for _, tc := range testQueries {

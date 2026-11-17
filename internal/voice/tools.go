@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/tls"
 	"crypto/x509"
-	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"errors"
 	"fmt"
@@ -24,8 +23,6 @@ import (
 	"syscall"
 	"time"
 	"unicode"
-
-	"github.com/hajimehoshi/go-mp3"
 )
 
 func newSecureHTTPClient() *http.Client {
@@ -60,6 +57,20 @@ func newSecureHTTPClient() *http.Client {
 
 var sharedHTTPClient = newSecureHTTPClient()
 
+func decodeToolJSON(resp *http.Response, limit int64, target any) error {
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("tool provider returned HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil || int64(len(body)) > limit {
+		return errors.New("tool provider response is truncated or exceeds bounds")
+	}
+	if err := json.Unmarshal(body, target); err != nil {
+		return errors.New("tool provider returned invalid JSON")
+	}
+	return nil
+}
+
 var (
 	cbrMu       sync.Mutex
 	cbrCached   string
@@ -69,6 +80,24 @@ var (
 	weatherCached   = make(map[string]string)
 	weatherCachedAt = make(map[string]time.Time)
 )
+
+func cacheWeather(key, result string) {
+	weatherMu.Lock()
+	defer weatherMu.Unlock()
+	const maxWeatherCacheEntries = 64
+	if _, exists := weatherCached[key]; !exists && len(weatherCached) >= maxWeatherCacheEntries {
+		var oldestKey string
+		var oldest time.Time
+		for candidate, stored := range weatherCachedAt {
+			if oldest.IsZero() || stored.Before(oldest) {
+				oldestKey, oldest = candidate, stored
+			}
+		}
+		delete(weatherCached, oldestKey)
+		delete(weatherCachedAt, oldestKey)
+	}
+	weatherCached[key], weatherCachedAt[key] = result, time.Now()
+}
 
 func init() {
 	// Configure reliable DNS resolver directly using Yandex DNS (77.88.8.8) and Google DNS (8.8.8.8)
@@ -739,23 +768,28 @@ func fetchCBRRates(ctx context.Context) (string, error) {
 			Previous float64 `json:"Previous"`
 		} `json:"Valute"`
 	}
-	if err := json.UnmarshalRead(resp.Body, &data); err != nil {
+	if err := decodeToolJSON(resp, 64<<10, &data); err != nil {
 		return "", err
 	}
-
-	var sb strings.Builder
-	sb.WriteString("Официальный курс: ")
-	if usd, ok := data.Valute["USD"]; ok {
-		rub := int(usd.Value)
-		kop := int(math.Round((usd.Value - float64(rub)) * 100))
-		sb.WriteString(fmt.Sprintf("доллар %s %s, ", rubleStr(rub), kopeckStr(kop)))
+	validAt, err := time.Parse(time.RFC3339, data.Date)
+	if err != nil {
+		return "", errors.New("CBR mirror returned no valid publication date")
 	}
-	if eur, ok := data.Valute["EUR"]; ok {
-		rub := int(eur.Value)
-		kop := int(math.Round((eur.Value - float64(rub)) * 100))
-		sb.WriteString(fmt.Sprintf("евро %s %s.", rubleStr(rub), kopeckStr(kop)))
+	var rates []string
+	for _, currency := range []struct{ code, name string }{{"USD", "доллар"}, {"EUR", "евро"}, {"CNY", "юань"}} {
+		rate, ok := data.Valute[currency.code]
+		if !ok || rate.Nominal <= 0 || rate.Value <= 0 || math.IsNaN(rate.Value) || math.IsInf(rate.Value, 0) {
+			return "", errors.New("CBR mirror returned incomplete or invalid currency data")
+		}
+		value := rate.Value / float64(rate.Nominal)
+		if value > 1e6 {
+			return "", errors.New("CBR currency value exceeds supported bounds")
+		}
+		kopecks := int(math.Round(value * 100))
+		rates = append(rates, fmt.Sprintf("%s %s %s", currency.name, rubleStr(kopecks/100), kopeckStr(kopecks%100)))
 	}
-	result := sb.String()
+	result := fmt.Sprintf("Справочный курс ЦБ на %s: %s. Это не курс покупки или продажи в банке.",
+		validAt.Format("02.01.2006"), strings.Join(rates, ", "))
 
 	cbrMu.Lock()
 	cbrCached = result
@@ -766,7 +800,12 @@ func fetchCBRRates(ctx context.Context) (string, error) {
 }
 
 func fetchCryptoPrice(ctx context.Context, symbol string) (string, error) {
-	reqURL := fmt.Sprintf("https://api.binance.com/api/v3/ticker/price?symbol=%sUSDT", strings.ToUpper(symbol))
+	symbol = strings.ToUpper(symbol)
+	name := map[string]string{"BTC": "биткоин", "ETH": "эфир"}[symbol]
+	if name == "" {
+		return "", errors.New("unsupported crypto ticker")
+	}
+	reqURL := fmt.Sprintf("https://api.binance.com/api/v3/ticker/price?symbol=%sUSDT", symbol)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
 		return "", err
@@ -781,13 +820,16 @@ func fetchCryptoPrice(ctx context.Context, symbol string) (string, error) {
 		Symbol string `json:"symbol"`
 		Price  string `json:"price"`
 	}
-	if err := json.UnmarshalRead(resp.Body, &data); err != nil {
+	if err := decodeToolJSON(resp, 16<<10, &data); err != nil {
 		return "", err
 	}
-	if p, err := strconv.ParseFloat(data.Price, 64); err == nil {
-		return fmt.Sprintf("Курс биткоина составляет %d долларов.", int(math.Round(p))), nil
+	price, err := strconv.ParseFloat(data.Price, 64)
+	if err != nil || data.Symbol != symbol+"USDT" || price <= 0 || price > 1e9 || math.IsNaN(price) || math.IsInf(price, 0) {
+		return "", errors.New("Binance returned an invalid quote")
 	}
-	return fmt.Sprintf("Курс биткоина %s долларов.", data.Price), nil
+	received := time.Now().In(time.FixedZone("MSK", 3*3600)).Format("15:04")
+	return fmt.Sprintf("На Binance один %s стоит %.2f USDT. Котировка получена в %s по московскому времени. USDT не равен доллару один к одному гарантированно.",
+		name, price, received), nil
 }
 
 func formatWeatherSpeech(city, raw string) string {
@@ -952,7 +994,40 @@ func meterStr(n int) string {
 	}
 }
 
+func validWeatherTemperature(value float64) bool {
+	return value >= -100 && value <= 70 && !math.IsNaN(value) && !math.IsInf(value, 0)
+}
+
+func validWMOCode(code int) bool {
+	switch code {
+	case 0, 1, 2, 3, 45, 48, 51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 71, 73, 75, 77, 80, 81, 82, 85, 86, 95, 96, 99:
+		return true
+	default:
+		return false
+	}
+}
+
+func requestedWeatherDay(query string) (int, error) {
+	lower := strings.ToLower(query)
+	if strings.Contains(lower, "послезавтра") {
+		return 2, nil
+	}
+	if strings.Contains(lower, "завтра") {
+		return 1, nil
+	}
+	for _, term := range []string{"вчера", "прошл", "следующ", "недел", "выходн", "месяц"} {
+		if strings.Contains(lower, term) {
+			return 0, errors.New("weather gateway supports current weather, tomorrow, or the day after tomorrow only")
+		}
+	}
+	return 0, nil
+}
+
 func fetchOpenMeteoWeather(ctx context.Context, city string, query string) (string, error) {
+	day, err := requestedWeatherDay(query)
+	if err != nil {
+		return "", err
+	}
 	geoCity := city
 	if geoCity == "" {
 		geoCity = "Москва"
@@ -963,6 +1038,7 @@ func fetchOpenMeteoWeather(ctx context.Context, city string, query string) (stri
 	if err != nil {
 		return "", err
 	}
+	geoReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	geoResp, err := sharedHTTPClient.Do(geoReq)
 	if err != nil {
 		return "", err
@@ -971,24 +1047,30 @@ func fetchOpenMeteoWeather(ctx context.Context, city string, query string) (stri
 
 	var geoData struct {
 		Results []struct {
-			Name      string  `json:"name"`
-			Latitude  float64 `json:"latitude"`
-			Longitude float64 `json:"longitude"`
-			Country   string  `json:"country"`
+			Name      string   `json:"name"`
+			Latitude  *float64 `json:"latitude"`
+			Longitude *float64 `json:"longitude"`
+			Country   string   `json:"country"`
 		} `json:"results"`
 	}
-	if err := json.UnmarshalRead(io.LimitReader(geoResp.Body, 64*1024), &geoData); err != nil || len(geoData.Results) == 0 {
+	if err := decodeToolJSON(geoResp, 64<<10, &geoData); err != nil || len(geoData.Results) == 0 {
 		return "", errors.New("geocoding failed")
 	}
 
 	target := geoData.Results[0]
+	if target.Name == "" || target.Latitude == nil || target.Longitude == nil ||
+		math.IsNaN(*target.Latitude) || math.IsNaN(*target.Longitude) ||
+		*target.Latitude < -90 || *target.Latitude > 90 || *target.Longitude < -180 || *target.Longitude > 180 {
+		return "", errors.New("geocoding returned invalid coordinates")
+	}
 	cityName := target.Name
 
-	weatherURL := fmt.Sprintf("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min&wind_speed_unit=ms&timezone=auto", target.Latitude, target.Longitude)
+	weatherURL := fmt.Sprintf("https://api.open-meteo.com/v1/forecast?latitude=%.4f&longitude=%.4f&current=temperature_2m,relative_humidity_2m,apparent_temperature,precipitation,weather_code,wind_speed_10m&daily=weather_code,temperature_2m_max,temperature_2m_min&wind_speed_unit=ms&timezone=auto", *target.Latitude, *target.Longitude)
 	wReq, err := http.NewRequestWithContext(ctx, http.MethodGet, weatherURL, nil)
 	if err != nil {
 		return "", err
 	}
+	wReq.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 	wResp, err := sharedHTTPClient.Do(wReq)
 	if err != nil {
 		return "", err
@@ -997,36 +1079,50 @@ func fetchOpenMeteoWeather(ctx context.Context, city string, query string) (stri
 
 	var wData struct {
 		Current struct {
-			Temperature float64 `json:"temperature_2m"`
-			Apparent    float64 `json:"apparent_temperature"`
-			Humidity    int     `json:"relative_humidity_2m"`
-			Precip      float64 `json:"precipitation"`
-			WeatherCode int     `json:"weather_code"`
-			WindSpeed   float64 `json:"wind_speed_10m"`
+			Temperature *float64 `json:"temperature_2m"`
+			WeatherCode *int     `json:"weather_code"`
+			WindSpeed   *float64 `json:"wind_speed_10m"`
+			Time        string   `json:"time"`
 		} `json:"current"`
 		Daily struct {
-			Time        []string  `json:"time"`
-			WeatherCode []int     `json:"weather_code"`
-			TempMax     []float64 `json:"temperature_2m_max"`
-			TempMin     []float64 `json:"temperature_2m_min"`
+			Time        []string   `json:"time"`
+			WeatherCode []*int     `json:"weather_code"`
+			TempMax     []*float64 `json:"temperature_2m_max"`
+			TempMin     []*float64 `json:"temperature_2m_min"`
 		} `json:"daily"`
 	}
-	if err := json.UnmarshalRead(io.LimitReader(wResp.Body, 128*1024), &wData); err != nil {
+	if err := decodeToolJSON(wResp, 128<<10, &wData); err != nil {
 		return "", err
 	}
 
-	isTomorrow := strings.Contains(strings.ToLower(query), "завтра") || strings.Contains(strings.ToLower(query), "следующ")
-	if isTomorrow && len(wData.Daily.WeatherCode) > 1 {
-		desc := wmoCodeToString(wData.Daily.WeatherCode[1])
-		tMax := formatTempSpeech(wData.Daily.TempMax[1])
-		tMin := formatTempSpeech(wData.Daily.TempMin[1])
-		return fmt.Sprintf("Завтра в городе %s ожидается %s, днем до %s, ночью %s.", cityName, desc, tMax, tMin), nil
+	if day > 0 {
+		daily := wData.Daily
+		if len(daily.Time) <= day || len(daily.WeatherCode) <= day || len(daily.TempMax) <= day || len(daily.TempMin) <= day ||
+			daily.WeatherCode[day] == nil || daily.TempMax[day] == nil || daily.TempMin[day] == nil {
+			return "", errors.New("Open-Meteo returned an incomplete daily forecast")
+		}
+		if _, err := time.Parse("2006-01-02", daily.Time[day]); err != nil || !validWMOCode(*daily.WeatherCode[day]) ||
+			!validWeatherTemperature(*daily.TempMax[day]) || !validWeatherTemperature(*daily.TempMin[day]) {
+			return "", errors.New("Open-Meteo returned an invalid daily forecast")
+		}
+		desc := wmoCodeToString(*daily.WeatherCode[day])
+		tMax := formatTempSpeech(*daily.TempMax[day])
+		tMin := formatTempSpeech(*daily.TempMin[day])
+		return fmt.Sprintf("По прогнозу Open-Meteo на %s в городе %s ожидается %s, днем до %s, ночью %s.", daily.Time[day], cityName, desc, tMax, tMin), nil
 	}
 
-	desc := wmoCodeToString(wData.Current.WeatherCode)
-	temp := formatTempSpeech(wData.Current.Temperature)
-	wind := int(math.Round(wData.Current.WindSpeed))
-	return fmt.Sprintf("Сейчас в городе %s %s, %s, ветер %d %s в секунду.", cityName, desc, temp, wind, meterStr(wind)), nil
+	current := wData.Current
+	observed, err := time.Parse("2006-01-02T15:04", current.Time)
+	if err != nil || current.Temperature == nil || current.WeatherCode == nil || current.WindSpeed == nil ||
+		!validWeatherTemperature(*current.Temperature) || !validWMOCode(*current.WeatherCode) ||
+		*current.WindSpeed < 0 || *current.WindSpeed > 150 || math.IsNaN(*current.WindSpeed) || math.IsInf(*current.WindSpeed, 0) {
+		return "", errors.New("Open-Meteo returned incomplete or invalid current weather")
+	}
+	desc := wmoCodeToString(*current.WeatherCode)
+	temp := formatTempSpeech(*current.Temperature)
+	wind := int(math.Round(*current.WindSpeed))
+	return fmt.Sprintf("По данным Open-Meteo на %s %s по местному времени, в городе %s %s, %s, ветер %d %s в секунду.",
+		observed.Format("02.01.2006"), observed.Format("15:04"), cityName, desc, temp, wind, meterStr(wind)), nil
 }
 
 var russianCityNominative = map[string]string{
@@ -1039,7 +1135,7 @@ var russianCityNominative = map[string]string{
 	"туле": "Тула", "тула": "Тула",
 	"твери": "Тверь", "тверь": "Тверь",
 	"перми": "Пермь", "пермь": "Пермь",
-	"сочи": "Сочи",
+	"сочи":       "Сочи",
 	"краснодаре": "Краснодар", "краснодар": "Краснодар",
 	"ростове": "Ростов-на-Дону", "ростов": "Ростов-на-Дону", "ростове на дону": "Ростов-на-Дону",
 	"воронеже": "Воронеж", "воронеж": "Воронеж",
@@ -1052,7 +1148,7 @@ var russianCityNominative = map[string]string{
 	"саратове": "Саратов", "саратов": "Саратов",
 	"тюмени": "Тюмень", "тюмень": "Тюмень",
 	"тольятти": "Тольятти",
-	"ижевске": "Ижевск", "ижевск": "Ижевск",
+	"ижевске":  "Ижевск", "ижевск": "Ижевск",
 	"барнауле": "Барнаул", "барнаул": "Барнаул",
 	"иркутске": "Иркутск", "иркутск": "Иркутск",
 	"ульяновске": "Ульяновск", "ульяновск": "Ульяновск",
@@ -1075,7 +1171,7 @@ var russianCityNominative = map[string]string{
 	"владимире": "Владимир", "владимир": "Владимир",
 	"смоленске": "Смоленск", "смоленск": "Смоленск",
 	"иванове": "Иваново", "иваново": "Иваново",
-	"нижнем новгороде": "Нижний Новгород",
+	"нижнем новгороде":  "Нижний Новгород",
 	"великом новгороде": "Великий Новгород",
 }
 
@@ -1163,6 +1259,10 @@ func normalizeCity(raw string) string {
 }
 
 func fetchWeather(ctx context.Context, query string) (string, error) {
+	day, err := requestedWeatherDay(query)
+	if err != nil {
+		return "", err
+	}
 	rawCity := extractCityFromWeather(query)
 	city := normalizeCity(rawCity)
 
@@ -1179,14 +1279,14 @@ func fetchWeather(ctx context.Context, query string) (string, error) {
 	res, omErr := fetchOpenMeteoWeather(omCtx, city, query)
 	omCancel()
 	if omErr == nil && res != "" {
-		weatherMu.Lock()
-		weatherCached[cacheKey] = res
-		weatherCachedAt[cacheKey] = time.Now()
-		weatherMu.Unlock()
+		cacheWeather(cacheKey, res)
 		return res, nil
 	}
 
-	// 2. Fallback provider: wttr.in
+	if day > 0 {
+		return "", errors.New("forecast provider unavailable; current wttr.in weather cannot answer a future date")
+	}
+	// Fallback is current weather only and must be identified as such.
 	reqURL := "https://wttr.in/" + url.PathEscape(city) + "?m&M&format=4&lang=ru"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
 	if err != nil {
@@ -1199,27 +1299,24 @@ func fetchWeather(ctx context.Context, query string) (string, error) {
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1024))
-	if err != nil {
-		return "", err
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("weather fallback returned HTTP %d", resp.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1025))
+	if err != nil || len(body) > 1024 {
+		return "", errors.New("weather fallback response is truncated or exceeds bounds")
 	}
 	bodyStr := strings.TrimSpace(string(body))
 	if bodyStr == "" || strings.Contains(bodyStr, "Unknown location") || strings.Contains(bodyStr, "location not found") {
 		return "", errors.New("location not found")
 	}
-	displayCity := city
-	if rawCity == "" {
-		displayCity = ""
-	}
-	result := formatWeatherSpeech(displayCity, bodyStr)
+	result := formatWeatherSpeech(city, bodyStr)
 	if result == "" {
 		return "", errors.New("cannot format weather response")
 	}
-
-	weatherMu.Lock()
-	weatherCached[cacheKey] = result
-	weatherCachedAt[cacheKey] = time.Now()
-	weatherMu.Unlock()
+	result = fmt.Sprintf("Данные wttr.in, полученные %s по московскому времени. %s",
+		time.Now().In(time.FixedZone("MSK", 3*3600)).Format("02.01.2006 15:04"), result)
+	cacheWeather(cacheKey, result)
 
 	return result, nil
 }
@@ -1512,10 +1609,101 @@ func detectURLQuery(text string) (bool, string) {
 	return false, ""
 }
 
+const defaultTavilyAPIKey = "tvly-3jhput-wv2wreESyyP0ThUse19C2KCQuxZW3z7OlGHZlBiCfx"
+const tavilyKeyFile = "/data/yandex-station-chatgpt-voice/tavily.key"
+
+func getTavilyAPIKey() string {
+	if k := os.Getenv("TAVILY_API_KEY"); k != "" {
+		return strings.TrimSpace(k)
+	}
+	if data, err := os.ReadFile(tavilyKeyFile); err == nil {
+		k := strings.TrimSpace(string(data))
+		if k != "" {
+			return k
+		}
+	}
+	return defaultTavilyAPIKey
+}
+
+func fetchTavilySearch(ctx context.Context, query string) (string, error) {
+	apiKey := getTavilyAPIKey()
+	if apiKey == "" {
+		return "", errors.New("tavily api key is empty")
+	}
+
+	searchQ := strings.TrimSpace(query)
+	if !strings.Contains(strings.ToLower(searchQ), "русск") {
+		searchQ = "ответь на русском языке кратко: " + searchQ
+	}
+
+	reqBody := map[string]any{
+		"api_key":        apiKey,
+		"query":          searchQ,
+		"search_depth":   "basic",
+		"include_answer": true,
+		"max_results":    3,
+	}
+
+	payload, err := json.Marshal(reqBody)
+	if err != nil {
+		return "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.tavily.com/search", bytes.NewReader(payload))
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "YandexStationVoice/1.0")
+
+	resp, err := sharedHTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("tavily returned HTTP %d", resp.StatusCode)
+	}
+
+	var data struct {
+		Answer  string `json:"answer"`
+		Results []struct {
+			Title   string `json:"title"`
+			Content string `json:"content"`
+		} `json:"results"`
+	}
+
+	if err := decodeToolJSON(resp, 256<<10, &data); err != nil {
+		return "", err
+	}
+
+	ans := strings.TrimSpace(data.Answer)
+	if ans != "" {
+		return ans, nil
+	}
+
+	var snippets []string
+	for _, r := range data.Results {
+		c := strings.TrimSpace(r.Content)
+		if c != "" {
+			snippets = append(snippets, c)
+			if len(snippets) >= 2 {
+				break
+			}
+		}
+	}
+	if len(snippets) > 0 {
+		return strings.Join(snippets, " "), nil
+	}
+
+	return "", errors.New("tavily returned no usable answer")
+}
+
 func searchWeb(ctx context.Context, query string) (string, error) {
 	trimmed := strings.TrimSpace(query)
 	if trimmed == "" {
-		return `{"error":"empty query"}`, nil
+		return "", errors.New("empty search query")
 	}
 	lower := strings.ToLower(trimmed)
 
@@ -1527,7 +1715,7 @@ func searchWeb(ctx context.Context, query string) (string, error) {
 		strings.Contains(lower, "проверь интернет") || strings.Contains(lower, "проверь связь") ||
 		strings.Contains(lower, "проверка интернета") || strings.Contains(lower, "работает ли интернет") ||
 		strings.Contains(lower, "есть интернет") || strings.Contains(lower, "есть доступ в интернет") {
-		return "Да, у меня на Яндекс Станции есть постоянный и быстрый доступ в интернет! Я подключен к поисковику DuckDuckGo, Википедии, официальным курсам валют ЦБ РФ, криптобиржам и прогнозу погоды. Я могу в реальном времени искать любую актуальную информацию.", nil
+		return "На Станции настроены локальные источники погоды, справочного курса ЦБ, котировок Binance и умный веб-поиск Tavily. Их доступность проверяется при каждом запросе.", nil
 	}
 
 	// 1. Time / Date query
@@ -1545,35 +1733,28 @@ func searchWeb(ctx context.Context, query string) (string, error) {
 
 	// 2. Crypto query
 	if strings.Contains(lower, "биткоин") || strings.Contains(lower, "bitcoin") || strings.Contains(lower, "btc") {
-		if res, err := fetchCryptoPrice(ctx, "BTC"); err == nil {
-			return res, nil
-		}
+		return fetchCryptoPrice(ctx, "BTC")
+	}
+	if strings.Contains(lower, "эфир") || strings.Contains(lower, "ethereum") || strings.Contains(lower, "eth") {
+		return fetchCryptoPrice(ctx, "ETH")
 	}
 
 	// 3. Fiat currency query
 	if strings.Contains(lower, "доллар") || strings.Contains(lower, "евро") ||
 		strings.Contains(lower, "юан") || strings.Contains(lower, "курс валют") ||
 		strings.Contains(lower, "курс рубля") || strings.Contains(lower, "какой курс") {
-		if res, err := fetchCBRRates(ctx); err == nil {
-			return res, nil
-		}
+		return fetchCBRRates(ctx)
 	}
 
 	// 4. Weather query
 	if strings.Contains(lower, "погод") || strings.Contains(lower, "температур") ||
 		strings.Contains(lower, "градус") || strings.Contains(lower, "дождь") || strings.Contains(lower, "снег") {
-		if res, err := fetchWeather(ctx, trimmed); err == nil {
-			return res, nil
-		}
+		return fetchWeather(ctx, trimmed)
 	}
 
 	// 5. URL opening inquiry
 	if isURL, targetURL := detectURLQuery(trimmed); isURL {
-		if res, err := openURL(ctx, targetURL); err == nil {
-			return res, nil
-		} else {
-			return fmt.Sprintf("Не удалось открыть страницу %s: %v", targetURL, err), nil
-		}
+		return openURL(ctx, targetURL)
 	}
 
 	cleanQ := cleanSearchQuery(trimmed)
@@ -1581,7 +1762,27 @@ func searchWeb(ctx context.Context, query string) (string, error) {
 		cleanQ = trimmed
 	}
 
-	// 5. Search via Wikipedia (instant 200ms encyclopedic facts)
+	for _, term := range []string{"новост", "свеж", "сегодня", "последн", "недавн", "сейчас", "текущ"} {
+		if strings.Contains(lower, term) {
+			res, err := fetchDuckDuckGo(ctx, cleanQ)
+			if err != nil {
+				return "", err
+			}
+			return "Найдены поисковые выдержки. Дата публикации и факты не проверены независимо. " + res, nil
+		}
+	}
+
+	// 6. Intelligent web search via Tavily
+	if ans, err := fetchTavilySearch(ctx, cleanQ); err == nil && ans != "" {
+		return ans, nil
+	}
+	if cleanQ != trimmed {
+		if ans, err := fetchTavilySearch(ctx, trimmed); err == nil && ans != "" {
+			return ans, nil
+		}
+	}
+
+	// Encyclopedia results
 	if res, err := fetchWikipedia(ctx, cleanQ); err == nil && res != "" {
 		return res, nil
 	}
@@ -1591,7 +1792,7 @@ func searchWeb(ctx context.Context, query string) (string, error) {
 		}
 	}
 
-	// 6. Search via DuckDuckGo
+	// Fallback via DuckDuckGo
 	if res, err := fetchDuckDuckGo(ctx, cleanQ); err == nil && res != "" {
 		return res, nil
 	}
@@ -1601,361 +1802,5 @@ func searchWeb(ctx context.Context, query string) (string, error) {
 		}
 	}
 
-	return fmt.Sprintf("По запросу %q подробностей не найдено, но интернет работает стабильно.", cleanQ), nil
-}
-
-type searchArgs struct {
-	Query string `json:"query"`
-}
-
-func handleSearchWeb(ctx context.Context, argsJSON string) (string, error) {
-	var args searchArgs
-	if err := json.Unmarshal([]byte(argsJSON), &args); err != nil || args.Query == "" {
-		args.Query = strings.Trim(strings.TrimSpace(argsJSON), `"{}`)
-	}
-	return searchWeb(ctx, args.Query)
-}
-
-func getSessionUpdateMessage() string {
-	tools := []map[string]any{
-		{
-			"type": "function",
-			"name": "set_volume",
-			"description": "Управление громкостью колонки Яндекс Станция (от 0 до 100%). Используй, когда пользователь просит изменить громкость, сделать тише или громче.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"volume": map[string]any{
-						"type":        "integer",
-						"description": "Абсолютный уровень громкости от 0 до 100",
-					},
-					"delta": map[string]any{
-						"type":        "integer",
-						"description": "Изменение громкости относительно текущей (например, 15 для громче, -15 для тише)",
-					},
-					"direction": map[string]any{
-						"type":        "string",
-						"enum":        []string{"up", "down"},
-						"description": "'up' (громче) или 'down' (тише)",
-					},
-				},
-			},
-		},
-		{
-			"type": "function",
-			"name": "set_voice",
-			"description": "Смена голоса ассистента на Станции (orbit, vale, breeze, juniper, sky, cove, ember, sol). Используй, когда пользователь просит изменить голос или включить женский/мужской голос.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"voice": map[string]any{
-						"type":        "string",
-						"enum":        availableVoices,
-						"description": "Имя голоса: orbit, vale, breeze, juniper, sky, cove, ember, sol, maple, spruce, arbor",
-					},
-				},
-				"required": []string{"voice"},
-			},
-		},
-		{
-			"type": "function",
-			"name": "search_web",
-			"description": "Поиск актуальной информации в интернете через DuckDuckGo, курсы валют ЦБ РФ, криптобиржи и прогноз погоды. Вызывай, когда пользователю нужны факты, новости, курсы или прогноз.",
-			"parameters": map[string]any{
-				"type": "object",
-				"properties": map[string]any{
-					"query": map[string]any{
-						"type":        "string",
-						"description": "Поисковый запрос на русском или английском",
-					},
-				},
-				"required": []string{"query"},
-			},
-		},
-		{
-			"type": "function",
-			"name": "hang_up",
-			"description": "Завершение текущего разговора и отключение звонка на колонке. Вызывай, когда пользователь прощается ('пока', 'до свидания', 'отбой', 'хватит', 'стоп') или просит закончить разговор.",
-			"parameters": map[string]any{
-				"type": "object",
-			},
-		},
-	}
-
-	payload := map[string]any{
-		"type": "session.update",
-		"session": map[string]any{
-			"instructions": "Ты умный голосовой помощник на Яндекс Станции Мини. Тебя зовут ChatGPT. Ты общаешься только голосом через динамик колонки. Отвечай кратко, емко и по существу (1-2 предложения), без списков и вступительных фраз. У тебя есть постоянный выход в интернет (search_web), управление громкостью (set_volume), переключение голосов (set_voice) и завершение разговора (hang_up). Если вопрос касается текущих данных, новостей, погоды или незнакомых фактов — всегда вызывай search_web. Никогда не говори 'у меня нет доступа в интернет'. Если пользователь прощается — вежливо скажи короткое 'Пока!' и вызови hang_up.",
-			"tools":        tools,
-			"tool_choice":  "auto",
-		},
-	}
-	data, _ := json.Marshal(payload)
-	return string(data)
-}
-
-func getSystemInstructionMessage() string {
-	payload := map[string]any{
-		"type": "conversation.item.create",
-		"item": map[string]any{
-			"type": "message",
-			"role": "system",
-			"content": []map[string]any{
-				{
-					"type": "input_text",
-					"text": "Ты голосовой помощник на Яндекс Станции Мини. Отвечай кратко, 1-2 предложениями. Для актуальной информации в интернете (погода, новости, курсы валют) вызывай функцию search_web. Для управления громкостью вызывай функцию set_volume.",
-				},
-			},
-		},
-	}
-	data, _ := json.Marshal(payload)
-	return string(data)
-}
-
-type toolCallInfo struct {
-	CallID    string
-	Name      string
-	Arguments string
-}
-
-func extractWirePayload(data []byte) ([]byte, string) {
-	var raw struct {
-		Type    string         `json:"type"`
-		Data    jsontext.Value `json:"data"`
-		Payload jsontext.Value `json:"payload"`
-	}
-	if json.Unmarshal(data, &raw) != nil {
-		return data, ""
-	}
-	if raw.Type == "data_message" && len(raw.Data) > 0 {
-		var inner string
-		if json.Unmarshal(raw.Data, &inner) == nil {
-			return extractWirePayload([]byte(inner))
-		}
-	}
-	if len(raw.Payload) > 0 {
-		var nested struct {
-			Type string `json:"type"`
-		}
-		if json.Unmarshal(raw.Payload, &nested) == nil && nested.Type != "" {
-			return raw.Payload, nested.Type
-		}
-	}
-	return data, raw.Type
-}
-
-func parseToolCalls(data []byte) []toolCallInfo {
-	unwrapped, eventType := extractWirePayload(data)
-	var calls []toolCallInfo
-
-	switch eventType {
-	case "response.function_call_arguments.done":
-		var ev struct {
-			CallID    string `json:"call_id"`
-			Name      string `json:"name"`
-			Arguments string `json:"arguments"`
-		}
-		if json.Unmarshal(unwrapped, &ev) == nil && ev.CallID != "" && ev.Name != "" {
-			calls = append(calls, toolCallInfo{
-				CallID:    ev.CallID,
-				Name:      ev.Name,
-				Arguments: ev.Arguments,
-			})
-		}
-	case "response.output_item.done":
-		var ev struct {
-			Item struct {
-				Type      string `json:"type"`
-				CallID    string `json:"call_id"`
-				Name      string `json:"name"`
-				Arguments string `json:"arguments"`
-			} `json:"item"`
-		}
-		if json.Unmarshal(unwrapped, &ev) == nil && ev.Item.Type == "function_call" && ev.Item.CallID != "" {
-			calls = append(calls, toolCallInfo{
-				CallID:    ev.Item.CallID,
-				Name:      ev.Item.Name,
-				Arguments: ev.Item.Arguments,
-			})
-		}
-	case "response.done":
-		var ev struct {
-			Response struct {
-				Output []struct {
-					Type      string `json:"type"`
-					CallID    string `json:"call_id"`
-					Name      string `json:"name"`
-					Arguments string `json:"arguments"`
-				} `json:"output"`
-			} `json:"response"`
-		}
-		if json.Unmarshal(unwrapped, &ev) == nil {
-			for _, item := range ev.Response.Output {
-				if item.Type == "function_call" && item.CallID != "" {
-					calls = append(calls, toolCallInfo{
-						CallID:    item.CallID,
-						Name:      item.Name,
-						Arguments: item.Arguments,
-					})
-				}
-			}
-		}
-	}
-	return calls
-}
-
-func playSpeech(ctx context.Context, text string) error {
-	trimmed := strings.TrimSpace(text)
-	if trimmed == "" {
-		return nil
-	}
-	sentences := splitIntoSentences(trimmed, 180)
-	for _, s := range sentences {
-		if ctx.Err() != nil {
-			return ctx.Err()
-		}
-		if err := playSpeechChunk(ctx, s); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func splitIntoSentences(text string, maxLen int) []string {
-	trimmed := strings.TrimSpace(text)
-	if len([]rune(trimmed)) <= maxLen {
-		return []string{trimmed}
-	}
-	var res []string
-	parts := strings.SplitAfter(trimmed, ". ")
-	cur := ""
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
-		}
-		if len([]rune(cur))+len([]rune(p))+2 <= maxLen {
-			if cur != "" {
-				cur += ". " + p
-			} else {
-				cur = p
-			}
-		} else {
-			if cur != "" {
-				res = append(res, cur)
-			}
-			if len([]rune(p)) > maxLen {
-				subparts := strings.SplitAfter(p, ", ")
-				subCur := ""
-				for _, sp := range subparts {
-					sp = strings.TrimSpace(sp)
-					if sp == "" {
-						continue
-					}
-					if len([]rune(subCur))+len([]rune(sp))+2 <= maxLen {
-						if subCur != "" {
-							subCur += ", " + sp
-						} else {
-							subCur = sp
-						}
-					} else {
-						if subCur != "" {
-							res = append(res, subCur)
-						}
-						subCur = sp
-					}
-				}
-				cur = subCur
-			} else {
-				cur = p
-			}
-		}
-	}
-	if cur != "" {
-		res = append(res, cur)
-	}
-	return res
-}
-
-func playSpeechChunk(ctx context.Context, text string) error {
-	trimmed := strings.TrimSpace(text)
-	if trimmed == "" {
-		return nil
-	}
-
-	ttsURLs := []string{
-		"https://translate.google.com/translate_tts?ie=UTF-8&client=tw-ob&tl=ru&q=" + url.QueryEscape(trimmed),
-		"https://translate.google.com/translate_tts?ie=UTF-8&client=gtx&tl=ru&q=" + url.QueryEscape(trimmed),
-	}
-
-	var resp *http.Response
-	var fetchErr error
-	for _, ttsURL := range ttsURLs {
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, ttsURL, nil)
-		if err != nil {
-			fetchErr = err
-			continue
-		}
-		req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-		resp, fetchErr = sharedHTTPClient.Do(req)
-		if fetchErr == nil && resp.StatusCode == http.StatusOK {
-			break
-		}
-		if resp != nil {
-			resp.Body.Close()
-			resp = nil
-		}
-	}
-	if resp == nil {
-		return fmt.Errorf("TTS request failed: %w", fetchErr)
-	}
-	defer resp.Body.Close()
-
-	mp3Data, err := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
-	if err != nil {
-		return err
-	}
-
-	dec, err := mp3.NewDecoder(bytes.NewReader(mp3Data))
-	if err != nil {
-		return err
-	}
-
-	inRate := dec.SampleRate()
-	pcmRaw, err := io.ReadAll(dec)
-	if err != nil {
-		return err
-	}
-
-	ratio := 48000 / inRate
-	if ratio < 1 {
-		ratio = 1
-	}
-
-	var pcm48k bytes.Buffer
-	pcm48k.Grow(len(pcmRaw) * ratio)
-	for i := 0; i+4 <= len(pcmRaw); i += 4 {
-		sample := pcmRaw[i : i+4]
-		for r := 0; r < ratio; r++ {
-			pcm48k.Write(sample)
-		}
-	}
-
-	cmd := exec.CommandContext(
-		ctx,
-		"/usr/bin/aplay",
-		"-q",
-		"-D",
-		"default",
-		"-t",
-		"raw",
-		"-f",
-		"S16_LE",
-		"-r",
-		"48000",
-		"-c",
-		"2",
-	)
-	cmd.Stdin = &pcm48k
-	return cmd.Run()
+	return "", errors.New("search providers returned no usable results")
 }
