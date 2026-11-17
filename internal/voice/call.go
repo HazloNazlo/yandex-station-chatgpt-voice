@@ -21,7 +21,7 @@ import (
 	"github.com/pion/webrtc/v4"
 )
 
-const signalingTimeout = 30 * time.Second
+const signalingTimeout = 45 * time.Second
 
 const maxRTCPPacketBytes = 1500
 
@@ -304,6 +304,10 @@ func signalingClient() *http.Client {
 	transport := defaultTransport.Clone()
 	transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
 	transport.MaxResponseHeaderBytes = maxSessionResponseBytes
+	transport.TLSHandshakeTimeout = 30 * time.Second
+	transport.ResponseHeaderTimeout = 30 * time.Second
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
 	return &http.Client{
 		Transport:     transport,
 		Timeout:       signalingTimeout,
@@ -357,7 +361,7 @@ func exchangeOffer(
 		if ctx.Err() != nil {
 			return "", context.Cause(ctx)
 		}
-		return "", errors.New("voice signaling HTTPS request failed; check network, TLS, and service availability")
+		return "", fmt.Errorf("voice signaling HTTPS request failed: %w", err)
 	}
 	defer response.Body.Close()
 	switch response.StatusCode {

@@ -561,6 +561,29 @@ func cuePCM(frequency float64) []int16 {
 	return pcm
 }
 
+func cueWAV(pcm []int16) []byte {
+	dataLen := len(pcm) * pcmSampleBytes
+	totalLen := 36 + dataLen
+	buf := make([]byte, 44+dataLen)
+	copy(buf[0:4], "RIFF")
+	binary.LittleEndian.PutUint32(buf[4:8], uint32(totalLen))
+	copy(buf[8:12], "WAVE")
+	copy(buf[12:16], "fmt ")
+	binary.LittleEndian.PutUint32(buf[16:20], 16)
+	binary.LittleEndian.PutUint16(buf[20:22], 1)
+	binary.LittleEndian.PutUint16(buf[22:24], 2)
+	binary.LittleEndian.PutUint32(buf[24:28], 48000)
+	binary.LittleEndian.PutUint32(buf[28:32], 48000*2*2)
+	binary.LittleEndian.PutUint16(buf[32:34], 4)
+	binary.LittleEndian.PutUint16(buf[34:36], 16)
+	copy(buf[36:40], "data")
+	binary.LittleEndian.PutUint32(buf[40:44], uint32(dataLen))
+	for i, sample := range pcm {
+		binary.LittleEndian.PutUint16(buf[44+i*2:], uint16(sample))
+	}
+	return buf
+}
+
 func playWakeCue(ctx context.Context) error {
 	return playCue(ctx, wakeCueFrequency)
 }
@@ -576,10 +599,7 @@ func playCue(parent context.Context, frequency float64) error {
 		return context.Cause(ctx)
 	}
 	pcm := cuePCM(frequency)
-	data := make([]byte, len(pcm)*pcmSampleBytes)
-	for i, sample := range pcm {
-		binary.LittleEndian.PutUint16(data[i*2:], uint16(sample))
-	}
+	wav := cueWAV(pcm)
 	cmd := exec.CommandContext(
 		ctx,
 		"/usr/bin/aplay",
@@ -587,15 +607,9 @@ func playCue(parent context.Context, frequency float64) error {
 		"-D",
 		"default",
 		"-t",
-		"raw",
-		"-f",
-		"S16_LE",
-		"-r",
-		"48000",
-		"-c",
-		"2",
+		"wav",
 	)
-	cmd.Stdin = bytes.NewReader(data)
+	cmd.Stdin = bytes.NewReader(wav)
 	if err := cmd.Run(); err != nil {
 		if cause := context.Cause(ctx); cause != nil {
 			return cause

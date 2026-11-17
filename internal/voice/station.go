@@ -14,7 +14,7 @@ import (
 
 const detectorQueueFrames = 40
 const captureQueueFrames = 600
-const setupTimeout = 30 * time.Second
+const setupTimeout = 45 * time.Second
 
 var errAlicePriority = errors.New("native Alice has priority")
 var errCleanup = errors.New("resource cleanup failed")
@@ -387,7 +387,9 @@ func runStationEpoch(e *stationEpoch, gate *stationGate, sessionFile string, set
 			}
 			e.report.Print("Yandex wake confirmed; connecting voice.")
 			go func() {
-				_ = playWakeCue(e.ctx)
+				if cueErr := playWakeCue(e.ctx); cueErr != nil && e.ctx.Err() == nil {
+					e.report.Print("Wake cue failed: ", cueErr)
+				}
 			}()
 			attemptErr = runCall(e, sessionFile, capture, settings)
 			if cause := context.Cause(
