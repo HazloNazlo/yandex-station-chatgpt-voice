@@ -27,9 +27,9 @@ import (
 
 const playbackQueueFrames = 12
 
-// Hold up to 10 seconds of remote audio while the completed transcript is
+// Hold up to 30 seconds of remote audio while the completed transcript is
 // classified. Ordinary RTP still uses the original 240 ms queue limit.
-const pendingPlaybackFrames = 500
+const pendingPlaybackFrames = 1500
 const localPlaybackFrames = 8
 const stereoFrameBytes = stereoChannels * pcmSampleBytes
 

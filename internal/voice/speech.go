@@ -193,15 +193,15 @@ func (s *neuralSpeech) speak(parent context.Context, a *audio, generation uint64
 	defer cancel()
 	start := time.Now()
 
-	// Direct native fast TTS synthesis with Edge Neural fallback when no proxy URL is configured.
+	// Direct native fast Edge Neural TTS synthesis with Google TTS fallback when no proxy URL is configured.
 	if s.config.URL == "" {
-		pcm, err := synthesizeGoogleTTS(ctx, text)
+		voice := s.config.Voice
+		if voice == "" {
+			voice = "ru-RU-SvetlanaNeural"
+		}
+		pcm, err := synthesizeEdgeTTSDirect(ctx, text, voice)
 		if err != nil {
-			voice := s.config.Voice
-			if voice == "" {
-				voice = "ru-RU-SvetlanaNeural"
-			}
-			pcm, err = synthesizeEdgeTTSDirect(ctx, text, voice)
+			pcm, err = synthesizeGoogleTTS(ctx, text)
 		}
 		if err != nil {
 			return stats, fmt.Errorf("local tts failed: %w", err)

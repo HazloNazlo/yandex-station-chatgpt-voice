@@ -29,7 +29,7 @@ echo "[2/3] Настройка автозапуска..."
 adb $DEVICE shell "cat << 'EOF' > /data/yandex-station-chatgpt-voice/run_daemon.sh
 #!/bin/sh
 export LD_LIBRARY_PATH=/system/vendor/quasar/libs:/system/vendor/lib:/system/lib:/usr/lib:/lib
-exec /data/yandex-station-chatgpt-voice/client supervise --log=/tmp/yandex-station-chatgpt-voice.log
+exec /data/yandex-station-chatgpt-voice/client supervise --log=/tmp/yandex-station-chatgpt-voice.log --backend-thinking-effort=disabled
 EOF
 chmod 755 /data/yandex-station-chatgpt-voice/run_daemon.sh"
 

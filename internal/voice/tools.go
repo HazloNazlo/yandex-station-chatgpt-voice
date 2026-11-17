@@ -540,6 +540,10 @@ func cleanSearchQuery(text string) string {
 	}, lower)
 
 	fillers := []string{
+		"можешь ты узнать", "можешь узнать", "ты можешь узнать", "сможешь узнать", "попробуй узнать",
+		"можешь ты найти", "можешь найти", "ты можешь найти", "сможешь найти", "попробуй найти",
+		"можешь ты посмотреть", "можешь посмотреть", "ты можешь посмотреть", "попробуй посмотреть",
+		"можешь ты поискать", "можешь поискать",
 		"посмотри в интернете", "посмотри в сети", "посмотри в википедии",
 		"найди в интернете", "найди в сети", "найди в гугле", "найди в яндексе",
 		"поищи в интернете", "поищи в сети", "поищи в википедии",
@@ -595,8 +599,13 @@ func detectSearchQuery(text string) (bool, string) {
 	// 1. Explicit search commands: user explicitly asks to look up on internet / web / wiki / google / yandex
 	explicitSearchMarkers := []string{
 		"в интернете", "в сети", "в википедии", "в гугле", "в яндексе", "в duckduckgo",
-		"погугли", "загугли",
-		"найди в инете", "поищи в инете", "посмотри в инете",
+		"погугли", "загугли", "пробей",
+		"найди в инете", "поищи в инете", "посмотри в инете", "узнай в инете",
+		"можешь ты узнать", "можешь узнать", "ты можешь узнать", "сможешь узнать", "попробуй узнать",
+		"можешь ты найти", "можешь найти", "ты можешь найти", "сможешь найти", "попробуй найти",
+		"можешь посмотреть", "ты можешь посмотреть", "попробуй посмотреть",
+		"узнай", "найди", "поищи", "посмотри", "что известно о", "что известно про",
+		"что пишут о", "что пишут про", "что говорят о", "что говорят про",
 	}
 	for _, marker := range explicitSearchMarkers {
 		if strings.Contains(lower, marker) {
@@ -615,6 +624,17 @@ func detectSearchQuery(text string) (bool, string) {
 	}
 
 	// 3. Real-time dynamic topics (rates, crypto, live weather, current date/time)
+	// General prices, goods, and market costs:
+	if strings.Contains(lower, "сколько стоит") || strings.Contains(lower, "сколько стоят") ||
+		strings.Contains(lower, "какая цена") || strings.Contains(lower, "какие цены") ||
+		strings.Contains(lower, "где какая цена") || strings.Contains(lower, "какова цена") ||
+		strings.Contains(lower, "цена на") || strings.Contains(lower, "цены на") ||
+		strings.Contains(lower, "цена за") || strings.Contains(lower, "цены за") ||
+		strings.Contains(lower, "стоимость") || strings.Contains(lower, "почем") ||
+		strings.Contains(lower, "дефицит") {
+		return true, trimmed
+	}
+
 	// Currency / Forex:
 	if strings.Contains(lower, "курс") ||
 		((strings.Contains(lower, "доллар") || strings.Contains(lower, "евро") || strings.Contains(lower, "юан") || strings.Contains(lower, "рубл")) &&
