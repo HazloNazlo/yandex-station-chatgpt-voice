@@ -293,8 +293,12 @@ func (p *peer) accept(answer string) error {
 	return nil
 }
 
+var productionSignalingClient = signalingClient()
+
 //nolint:gochecknoglobals // Offline session tests replace this HTTP-client boundary while exercising fixed-origin requests.
-var callClient = signalingClient
+var callClient = func() *http.Client {
+	return productionSignalingClient
+}
 
 func signalingClient() *http.Client {
 	defaultTransport, ok := http.DefaultTransport.(*http.Transport)
@@ -308,11 +312,28 @@ func signalingClient() *http.Client {
 	transport.ResponseHeaderTimeout = 30 * time.Second
 	transport.ForceAttemptHTTP2 = false
 	transport.TLSNextProto = make(map[string]func(authority string, c *tls.Conn) http.RoundTripper)
+	transport.MaxIdleConns = 10
+	transport.MaxIdleConnsPerHost = 5
+	transport.IdleConnTimeout = 120 * time.Second
 	return &http.Client{
 		Transport:     transport,
 		Timeout:       signalingTimeout,
 		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
 	}
+}
+
+func warmSignalingConnection(ctx context.Context) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodHead, "https://chatgpt.com/", nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	client := callClient()
+	resp, err := client.Do(req)
+	if err != nil {
+		return
+	}
+	_ = resp.Body.Close()
 }
 
 //nolint:funlen // Keep request validation, response bounds, and sanitized failures together.
@@ -414,7 +435,6 @@ func runCall(e *stationEpoch, sessionFile string, capture *stationCapture, setti
 		return context.Cause(e.ctx)
 	}
 	client := callClient()
-	defer client.CloseIdleConnections()
 	renewCtx, stopRenew := context.WithTimeoutCause(e.ctx, renewTimeout, errRenewTimeout)
 	auth, err := sessionForCall(renewCtx, sessionFile, client, e.report)
 	stopRenew()

@@ -359,6 +359,7 @@ func runStationEpoch(e *stationEpoch, gate *stationGate, sessionFile string, set
 	})
 	defer func() { e.revoke(context.Canceled); reader.Wait() }()
 	e.report.Print("Yandex wake detection armed.")
+	go warmSignalingConnection(e.ctx)
 	for {
 		select {
 		case <-e.ctx.Done():
@@ -386,11 +387,6 @@ func runStationEpoch(e *stationEpoch, gate *stationGate, sessionFile string, set
 				return attemptErr
 			}
 			e.report.Print("Yandex wake confirmed; connecting voice.")
-			go func() {
-				if cueErr := playWakeCue(e.ctx); cueErr != nil && e.ctx.Err() == nil {
-					e.report.Print("Wake cue failed: ", cueErr)
-				}
-			}()
 			attemptErr = runCall(e, sessionFile, capture, settings)
 			if cause := context.Cause(
 				e.ctx,
