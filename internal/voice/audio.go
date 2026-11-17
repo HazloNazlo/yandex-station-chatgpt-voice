@@ -61,6 +61,7 @@ const playbackDrainTimeout = 2 * time.Second
 const cueTimeout = 2 * time.Second
 const cueVolume = 0.3
 const playbackGain = 1.0 // Unity gain ensures native hardware AEC (vqe_0) cancellation operates cleanly without distortion or clipping
+const wakeCueFrequency = 587.33
 const readyCueFrequency = 880
 const endCueFrequency = 440
 
@@ -558,6 +559,10 @@ func cuePCM(frequency float64) []int16 {
 		pcm[i*2], pcm[i*2+1] = sample, sample
 	}
 	return pcm
+}
+
+func playWakeCue(ctx context.Context) error {
+	return playCue(ctx, wakeCueFrequency)
 }
 
 func playEndCue(ctx context.Context) error {
